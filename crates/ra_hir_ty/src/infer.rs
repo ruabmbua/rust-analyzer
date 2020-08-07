@@ -21,7 +21,7 @@ use std::sync::Arc;
 use hir_def::{
     body::Body,
     data::{ConstData, FunctionData, StaticData},
-    expr::{BindingAnnotation, ExprId, PatId},
+    expr::{ArithOp, BinaryOp, BindingAnnotation, ExprId, PatId, LogicOp},
     lang_item::LangItemTarget,
     path::{path, Path},
     resolver::{HasResolver, Resolver, TypeNs},
@@ -631,6 +631,31 @@ impl<'a> InferenceContext<'a> {
 
     fn resolve_ops_index_output(&self) -> Option<TypeAliasId> {
         let trait_ = self.resolve_ops_index()?;
+        self.db.trait_data(trait_).associated_type_by_name(&name![Output])
+    }
+
+    fn resolve_ops(&self, bop: &BinaryOp) -> Option<TraitId> {
+        let lang_item = match bop {
+            BinaryOp::ArithOp(aop) => match aop {
+                ArithOp::Add => "add",
+                ArithOp::Sub => "sub",
+                ArithOp::Mul => "mul",
+                ArithOp::Div => "div",
+                ArithOp::Shl => "shl",
+                ArithOp::Shr => "shr",
+                ArithOp::Rem => "rem",
+                ArithOp::BitXor => "bitxor",
+                ArithOp::BitOr => "bitor",
+                ArithOp::BitAnd => "bitand",
+            },
+            _ => return None,
+        };
+
+        self.resolve_lang_item(lang_item)?.as_trait()
+    }
+
+    fn resolve_ops_output(&self, bop: &BinaryOp) -> Option<TypeAliasId> {
+        let trait_ = self.resolve_ops(bop)?;
         self.db.trait_data(trait_).associated_type_by_name(&name![Output])
     }
 }

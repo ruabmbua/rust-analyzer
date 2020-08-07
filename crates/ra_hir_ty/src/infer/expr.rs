@@ -517,20 +517,43 @@ impl<'a> InferenceContext<'a> {
                     }
                 }
             }
+            Expr::BinaryOp { lhs, rhs, op: Some(op @ BinaryOp::LogicOp(..)) } => {
+                let lhs_ty =
+                    self.infer_expr(*lhs, &Expectation::has_type(Ty::simple(TypeCtor::Bool)));
+                let expectation_rhs = op::binary_op_rhs_expectation(*op, lhs_ty.clone());
+                let rhs_ty = self.infer_expr(*rhs, &Expectation::has_type(expectation_rhs));
+                op::binary_op_return_ty(*op, lhs_ty, rhs_ty)
+            }
             Expr::BinaryOp { lhs, rhs, op } => match op {
                 Some(op) => {
-                    let lhs_expectation = match op {
-                        BinaryOp::LogicOp(..) => Expectation::has_type(Ty::simple(TypeCtor::Bool)),
-                        _ => Expectation::none(),
-                    };
-                    let lhs_ty = self.infer_expr(*lhs, &lhs_expectation);
-                    // FIXME: find implementation of trait corresponding to operation
-                    // symbol and resolve associated `Output` type
-                    let rhs_expectation = op::binary_op_rhs_expectation(*op, lhs_ty.clone());
-                    let rhs_ty = self.infer_expr(*rhs, &Expectation::has_type(rhs_expectation));
+                    // TODO: Handle falling back to default integer, and float types, if the exact type can not be inferred.
 
-                    // FIXME: similar as above, return ty is often associated trait type
-                    op::binary_op_return_ty(*op, lhs_ty, rhs_ty)
+                    let lhs_ty = self.infer_expr_inner(*lhs, &Expectation::none());
+
+                    let rhs_ty = self.infer_expr(*rhs, &Expectation::none());
+
+                    if let (Some(op_trait), Some(krate)) =
+                        (self.resolve_ops(op), self.resolver.krate())
+                    {
+                        let canonicalized_self_ty = self.canonicalizer().canonicalize_ty(lhs_ty);
+                        let self_ty = method_resolution::resolve_op(
+                            self.db,
+                            &canonicalized_self_ty.value,
+                            self.trait_env.clone(),
+                            krate,
+                            op_trait,
+                        );
+                        let self_ty = self_ty.map_or(Ty::Unknown, |t| {
+                            canonicalized_self_ty.decanonicalize_ty(t.value)
+                        });
+                        self.resolve_associated_type_with_params(
+                            self_ty,
+                            self.resolve_ops_output(op),
+                            &[rhs_ty],
+                        )
+                    } else {
+                        Ty::Unknown
+                    }
                 }
                 _ => Ty::Unknown,
             },
@@ -580,7 +603,7 @@ impl<'a> InferenceContext<'a> {
                     (self.resolve_ops_index(), self.resolver.krate())
                 {
                     let canonicalized = self.canonicalizer().canonicalize_ty(base_ty);
-                    let self_ty = method_resolution::resolve_indexing_op(
+                    let self_ty = method_resolution::resolve_op(
                         self.db,
                         &canonicalized.value,
                         self.trait_env.clone(),
