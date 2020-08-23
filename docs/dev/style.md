@@ -65,7 +65,7 @@ There are many benefits to this:
 It also makes sense to format snippets more compactly (for example, by placing enum definitions like `enum E { Foo, Bar }` on a single line),
 as long as they are still readable.
 
-## Order of Imports
+# Order of Imports
 
 Separate import groups with blank lines.
 Use one `use` per crate.
@@ -91,19 +91,19 @@ use super::{}
 Module declarations come before the imports.
 Order them in "suggested reading order" for a person new to the code base.
 
-## Import Style
+# Import Style
 
 Qualify items from `hir` and `ast`.
 
 ```rust
 // Good
-use ra_syntax::ast;
+use syntax::ast;
 
 fn frobnicate(func: hir::Function, strukt: ast::StructDef) {}
 
 // Not as good
 use hir::Function;
-use ra_syntax::ast::StructDef;
+use syntax::ast::StructDef;
 
 fn frobnicate(func: Function, strukt: StructDef) {}
 ```
@@ -112,7 +112,7 @@ Avoid local `use MyEnum::*` imports.
 
 Prefer `use crate::foo::bar` to `use super::bar`.
 
-## Order of Items
+# Order of Items
 
 Optimize for the reader who sees the file for the first time, and wants to get a general idea about what's going on.
 People read things from top to bottom, so place most important things first.
@@ -143,20 +143,25 @@ struct Foo {
 }
 ```
 
-## Variable Naming
+# Variable Naming
 
 Use boring and long names for local variables ([yay code completion](https://github.com/rust-analyzer/rust-analyzer/pull/4162#discussion_r417130973)).
 The default name is a lowercased name of the type: `global_state: GlobalState`.
 Avoid ad-hoc acronyms and contractions, but use the ones that exist consistently (`db`, `ctx`, `acc`).
-The default name for "result of the function" local variable is `res`.
-The default name for "I don't really care about the name" variable is `it`.
 
-## Collection types
+Default names:
+
+* `res` -- "result of the function" local variable
+* `it` -- I don't really care about the name
+* `n_foo` -- number of foos
+* `foo_idx` -- index of `foo`
+
+# Collection types
 
 Prefer `rustc_hash::FxHashMap` and `rustc_hash::FxHashSet` instead of the ones in `std::collections`.
 They use a hasher that's slightly faster and using them consistently will reduce code size by some small amount.
 
-## Preconditions
+# Preconditions
 
 Express function preconditions in types and force the caller to provide them (rather than checking in callee):
 
@@ -176,7 +181,36 @@ fn frobnicate(walrus: Option<Walrus>) {
 }
 ```
 
-## Premature Pessimization
+# Getters & Setters
+
+If a field can have any value without breaking invariants, make the field public.
+Conversely, if there is an invariant, document it, enforce it in the "constructor" function, make the field private, and provide a getter.
+Never provide setters.
+
+Getters should return borrowed data:
+
+```
+struct Person {
+    // Invariant: never empty
+    first_name: String,
+    middle_name: Option<String>
+}
+
+// Good
+impl Person {
+    fn first_name(&self) -> &str { self.first_name.as_str() }
+    fn middle_name(&self) -> Option<&str> { self.middle_name.as_ref() }
+}
+
+// Not as good
+impl Person {
+    fn first_name(&self) -> String { self.first_name.clone() }
+    fn middle_name(&self) -> &Option<String> { &self.middle_name }
+}
+```
+
+
+# Premature Pessimization
 
 Avoid writing code which is slower than it needs to be.
 Don't allocate a `Vec` where an iterator would do, don't allocate strings needlessly.
@@ -197,16 +231,17 @@ if words.len() != 2 {
 }
 ```
 
-## Documentation
+# Documentation
 
 For `.md` and `.adoc` files, prefer a sentence-per-line format, don't wrap lines.
 If the line is too long, you want to split the sentence in two :-)
 
-## Commit Style
+# Commit Style
 
 We don't have specific rules around git history hygiene.
-Maintaining clean git history is encouraged, but not enforced.
+Maintaining clean git history is strongly encouraged, but not enforced.
 Use rebase workflow, it's OK to rewrite history during PR review process.
+After you are happy with the state of the code, please use [interactive rebase](https://git-scm.com/book/en/v2/Git-Tools-Rewriting-History) to squash fixup commits.
 
 Avoid @mentioning people in commit messages and pull request descriptions(they are added to commit message by bors).
 Such messages create a lot of duplicate notification traffic during rebases.

@@ -1,7 +1,7 @@
 //! This module generates AST datatype used by rust-analyzer.
 //!
 //! Specifically, it generates the `SyntaxKind` enum and a number of newtype
-//! wrappers around `SyntaxNode` which implement `ra_syntax::AstNode`.
+//! wrappers around `SyntaxNode` which implement `syntax::AstNode`.
 
 use std::{
     collections::{BTreeSet, HashSet},
@@ -14,7 +14,7 @@ use ungrammar::{rust_grammar, Grammar, Rule};
 
 use crate::{
     ast_src::{AstEnumSrc, AstNodeSrc, AstSrc, Cardinality, Field, KindsSrc, KINDS_SRC},
-    codegen::{self, update, Mode},
+    codegen::{reformat, update, Mode},
     project_root, Result,
 };
 
@@ -22,15 +22,15 @@ pub fn generate_syntax(mode: Mode) -> Result<()> {
     let grammar = rust_grammar();
     let ast = lower(&grammar);
 
-    let syntax_kinds_file = project_root().join(codegen::SYNTAX_KINDS);
+    let syntax_kinds_file = project_root().join("crates/parser/src/syntax_kind/generated.rs");
     let syntax_kinds = generate_syntax_kinds(KINDS_SRC)?;
     update(syntax_kinds_file.as_path(), &syntax_kinds, mode)?;
 
-    let ast_tokens_file = project_root().join(codegen::AST_TOKENS);
+    let ast_tokens_file = project_root().join("crates/syntax/src/ast/generated/tokens.rs");
     let contents = generate_tokens(&ast)?;
     update(ast_tokens_file.as_path(), &contents, mode)?;
 
-    let ast_nodes_file = project_root().join(codegen::AST_NODES);
+    let ast_nodes_file = project_root().join("crates/syntax/src/ast/generated/nodes.rs");
     let contents = generate_nodes(KINDS_SRC, &ast)?;
     update(ast_nodes_file.as_path(), &contents, mode)?;
 
@@ -61,7 +61,7 @@ fn generate_tokens(grammar: &AstSrc) -> Result<String> {
         }
     });
 
-    let pretty = crate::reformat(quote! {
+    let pretty = reformat(quote! {
         use crate::{SyntaxKind::{self, *}, SyntaxToken, ast::AstToken};
         #(#tokens)*
     })?
@@ -261,7 +261,7 @@ fn generate_nodes(kinds: KindsSrc<'_>, grammar: &AstSrc) -> Result<String> {
         }
     }
 
-    let pretty = crate::reformat(res)?;
+    let pretty = reformat(res)?;
     Ok(pretty)
 }
 
@@ -383,7 +383,7 @@ fn generate_syntax_kinds(grammar: KindsSrc<'_>) -> Result<String> {
         }
     };
 
-    crate::reformat(ast)
+    reformat(ast)
 }
 
 fn to_upper_snake_case(s: &str) -> String {
@@ -477,6 +477,7 @@ impl Field {
                     "#" => "pound",
                     "?" => "question_mark",
                     "," => "comma",
+                    "|" => "pipe",
                     _ => name,
                 };
                 format_ident!("{}_token", name)

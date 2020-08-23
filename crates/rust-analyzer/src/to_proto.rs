@@ -4,15 +4,15 @@ use std::{
     sync::atomic::{AtomicU32, Ordering},
 };
 
-use itertools::Itertools;
-use ra_db::{FileId, FileRange};
-use ra_ide::{
+use base_db::{FileId, FileRange};
+use ide::{
     Assist, AssistKind, CallInfo, CompletionItem, CompletionItemKind, Documentation,
     FileSystemEdit, Fold, FoldKind, Highlight, HighlightModifier, HighlightTag, HighlightedRange,
     Indel, InlayHint, InlayKind, InsertTextFormat, LineIndex, Markup, NavigationTarget,
     ReferenceAccess, ResolvedAssist, Runnable, Severity, SourceChange, SourceFileEdit, TextEdit,
 };
-use ra_syntax::{SyntaxKind, TextRange, TextSize};
+use itertools::Itertools;
+use syntax::{SyntaxKind, TextRange, TextSize};
 
 use crate::{
     cargo_target_spec::CargoTargetSpec, global_state::GlobalStateSnapshot,
@@ -400,6 +400,7 @@ fn semantic_token_type_and_modifiers(
             HighlightModifier::Injected => semantic_tokens::INJECTED,
             HighlightModifier::ControlFlow => semantic_tokens::CONTROL_FLOW,
             HighlightModifier::Mutable => semantic_tokens::MUTABLE,
+            HighlightModifier::Consuming => semantic_tokens::CONSUMING,
             HighlightModifier::Unsafe => semantic_tokens::UNSAFE,
         };
         mods |= modifier;
@@ -704,8 +705,8 @@ pub(crate) fn unresolved_code_action(
     index: usize,
 ) -> Result<lsp_ext::CodeAction> {
     let res = lsp_ext::CodeAction {
-        title: assist.label,
-        id: Some(format!("{}:{}", assist.id.0.to_owned(), index.to_string())),
+        title: assist.label.to_string(),
+        id: Some(format!("{}:{}", assist.id.0, index.to_string())),
         group: assist.group.filter(|_| snap.config.client_caps.code_action_group).map(|gr| gr.0),
         kind: Some(code_action_kind(assist.id.1)),
         edit: None,
@@ -755,12 +756,13 @@ pub(crate) fn runnable(
 }
 
 pub(crate) fn markup_content(markup: Markup) -> lsp_types::MarkupContent {
-    lsp_types::MarkupContent { kind: lsp_types::MarkupKind::Markdown, value: markup.into() }
+    let value = crate::markdown::format_docs(markup.as_str());
+    lsp_types::MarkupContent { kind: lsp_types::MarkupKind::Markdown, value }
 }
 
 #[cfg(test)]
 mod tests {
-    use ra_ide::Analysis;
+    use ide::Analysis;
 
     use super::*;
 
