@@ -6,7 +6,9 @@ Our approach to "clean code" is two-fold:
 It is explicitly OK for a reviewer to flag only some nits in the PR, and then send a follow-up cleanup PR for things which are easier to explain by example, cc-ing the original author.
 Sending small cleanup PRs (like renaming a single local variable) is encouraged.
 
-# Scale of Changes
+# General
+
+## Scale of Changes
 
 Everyone knows that it's better to send small & focused pull requests.
 The problem is, sometimes you *have* to, eg, rewrite the whole compiler, and that just doesn't fit into a set of isolated PRs.
@@ -45,13 +47,35 @@ That said, adding an innocent-looking `pub use` is a very simple way to break en
 Note: if you enjoyed this abstract hand-waving about boundaries, you might appreciate
 https://www.tedinski.com/2018/02/06/system-boundaries.html
 
-# Crates.io Dependencies
+## Crates.io Dependencies
 
 We try to be very conservative with usage of crates.io dependencies.
 Don't use small "helper" crates (exception: `itertools` is allowed).
 If there's some general reusable bit of code you need, consider adding it to the `stdx` crate.
 
-# Minimal Tests
+## Commit Style
+
+We don't have specific rules around git history hygiene.
+Maintaining clean git history is strongly encouraged, but not enforced.
+Use rebase workflow, it's OK to rewrite history during PR review process.
+After you are happy with the state of the code, please use [interactive rebase](https://git-scm.com/book/en/v2/Git-Tools-Rewriting-History) to squash fixup commits.
+
+Avoid @mentioning people in commit messages and pull request descriptions(they are added to commit message by bors).
+Such messages create a lot of duplicate notification traffic during rebases.
+
+## Clippy
+
+We don't enforce Clippy.
+A number of default lints have high false positive rate.
+Selectively patching false-positives with `allow(clippy)` is considered worse than not using Clippy at all.
+There's `cargo xtask lint` command which runs a subset of low-FPR lints.
+Careful tweaking of `xtask lint` is welcome.
+See also [rust-lang/clippy#5537](https://github.com/rust-lang/rust-clippy/issues/5537).
+Of course, applying Clippy suggestions is welcome as long as they indeed improve the code.
+
+# Code
+
+## Minimal Tests
 
 Most tests in rust-analyzer start with a snippet of Rust code.
 This snippets should be minimal -- if you copy-paste a snippet of real code into the tests, make sure to remove everything which could be removed.
@@ -65,7 +89,182 @@ There are many benefits to this:
 It also makes sense to format snippets more compactly (for example, by placing enum definitions like `enum E { Foo, Bar }` on a single line),
 as long as they are still readable.
 
-# Order of Imports
+## Preconditions
+
+Express function preconditions in types and force the caller to provide them (rather than checking in callee):
+
+```rust
+// Good
+fn frbonicate(walrus: Walrus) {
+    ...
+}
+
+// Not as good
+fn frobnicate(walrus: Option<Walrus>) {
+    let walrus = match walrus {
+        Some(it) => it,
+        None => return,
+    };
+    ...
+}
+```
+
+Avoid preconditions that span across function boundaries:
+
+```rust
+// Good
+fn main() {
+    let s: &str = ...;
+    if let Some(contents) = string_literal_contents(s) {
+
+    }
+}
+
+fn string_literal_contents(s: &str) -> Option<&str> {
+    if s.starts_with('"') && s.ends_with('"') {
+        Some(&s[1..s.len() - 1])
+    } else {
+        None
+    }
+}
+
+// Not as good
+fn main() {
+    let s: &str = ...;
+    if is_string_literal(s) {
+        let contents = &s[1..s.len() - 1];
+    }
+}
+
+fn is_string_literal(s: &str) -> bool {
+    s.starts_with('"') && s.ends_with('"')
+}
+```
+
+In the "Not as good" version, the precondition that `1` is a valid char boundary is checked in `is_string_literal` and used in `foo`.
+In the "Good" version, the precondition check and usage are checked in the same block, and then encoded in the types.
+
+When checking a boolean precondition, prefer `if !invariant` to `if negated_invariant`:
+
+```rust
+// Good
+if !(idx < len) {
+    return None;
+}
+
+// Not as good
+if idx >= len {
+    return None;
+}
+```
+
+## Getters & Setters
+
+If a field can have any value without breaking invariants, make the field public.
+Conversely, if there is an invariant, document it, enforce it in the "constructor" function, make the field private, and provide a getter.
+Never provide setters.
+
+Getters should return borrowed data:
+
+```rust
+struct Person {
+    // Invariant: never empty
+    first_name: String,
+    middle_name: Option<String>
+}
+
+// Good
+impl Person {
+    fn first_name(&self) -> &str { self.first_name.as_str() }
+    fn middle_name(&self) -> Option<&str> { self.middle_name.as_ref() }
+}
+
+// Not as good
+impl Person {
+    fn first_name(&self) -> String { self.first_name.clone() }
+    fn middle_name(&self) -> &Option<String> { &self.middle_name }
+}
+```
+
+## Avoid Monomorphization
+
+Rust uses monomorphization to compile generic code, meaning that for each instantiation of a generic functions with concrete types, the function is compiled afresh, *per crate*.
+This allows for exceptionally good performance, but leads to increased compile times.
+Runtime performance obeys 80%/20% rule -- only a small fraction of code is hot.
+Compile time **does not** obey this rule -- all code has to be compiled.
+For this reason, avoid making a lot of code type parametric, *especially* on the boundaries between crates.
+
+```rust
+// Good
+fn frbonicate(f: impl FnMut()) {
+    frobnicate_impl(&mut f)
+}
+fn frobnicate_impl(f: &mut dyn FnMut()) {
+    // lots of code
+}
+
+// Not as good
+fn frbonicate(f: impl FnMut()) {
+    // lots of code
+}
+```
+
+Avoid `AsRef` polymorphism, it pays back only for widely used libraries:
+
+```rust
+// Good
+fn frbonicate(f: &Path) {
+}
+
+// Not as good
+fn frbonicate(f: impl AsRef<Path>) {
+}
+```
+
+# Premature Pessimization
+
+Avoid writing code which is slower than it needs to be.
+Don't allocate a `Vec` where an iterator would do, don't allocate strings needlessly.
+
+```rust
+// Good
+use itertools::Itertools;
+
+let (first_word, second_word) = match text.split_ascii_whitespace().collect_tuple() {
+    Some(it) => it,
+    None => return,
+}
+
+// Not as good
+let words = text.split_ascii_whitespace().collect::<Vec<_>>();
+if words.len() != 2 {
+    return
+}
+```
+
+If allocation is inevitable, let the caller allocate the resource:
+
+```rust
+// Good
+fn frobnicate(s: String) {
+    ...
+}
+
+// Not as good
+fn frobnicate(s: &str) {
+    let s = s.to_string();
+    ...
+}
+```
+
+## Collection types
+
+Prefer `rustc_hash::FxHashMap` and `rustc_hash::FxHashSet` instead of the ones in `std::collections`.
+They use a hasher that's slightly faster and using them consistently will reduce code size by some small amount.
+
+# Style
+
+## Order of Imports
 
 Separate import groups with blank lines.
 Use one `use` per crate.
@@ -91,7 +290,7 @@ use super::{}
 Module declarations come before the imports.
 Order them in "suggested reading order" for a person new to the code base.
 
-# Import Style
+## Import Style
 
 Qualify items from `hir` and `ast`.
 
@@ -112,7 +311,23 @@ Avoid local `use MyEnum::*` imports.
 
 Prefer `use crate::foo::bar` to `use super::bar`.
 
-# Order of Items
+When implementing `Debug` or `Display`, import `std::fmt`:
+
+```rust
+// Good
+use std::fmt;
+
+impl fmt::Display for RenameError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { .. }
+}
+
+// Not as good
+impl std::fmt::Display for RenameError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { .. }
+}
+```
+
+## Order of Items
 
 Optimize for the reader who sees the file for the first time, and wants to get a general idea about what's going on.
 People read things from top to bottom, so place most important things first.
@@ -143,7 +358,7 @@ struct Foo {
 }
 ```
 
-# Variable Naming
+## Variable Naming
 
 Use boring and long names for local variables ([yay code completion](https://github.com/rust-analyzer/rust-analyzer/pull/4162#discussion_r417130973)).
 The default name is a lowercased name of the type: `global_state: GlobalState`.
@@ -156,92 +371,45 @@ Default names:
 * `n_foo` -- number of foos
 * `foo_idx` -- index of `foo`
 
-# Collection types
 
-Prefer `rustc_hash::FxHashMap` and `rustc_hash::FxHashSet` instead of the ones in `std::collections`.
-They use a hasher that's slightly faster and using them consistently will reduce code size by some small amount.
+## Early Returns
 
-# Preconditions
-
-Express function preconditions in types and force the caller to provide them (rather than checking in callee):
+Do use early returns
 
 ```rust
 // Good
-fn frbonicate(walrus: Walrus) {
-    ...
+fn foo() -> Option<Bar> {
+    if !condition() {
+        return None;
+    }
+
+    Some(...)
 }
 
 // Not as good
-fn frobnicate(walrus: Option<Walrus>) {
-    let walrus = match walrus {
-        Some(it) => it,
-        None => return,
-    };
-    ...
+fn foo() -> Option<Bar> {
+    if condition() {
+        Some(...)
+    } else {
+        None
+    }
 }
 ```
 
-# Getters & Setters
+## Comparisons
 
-If a field can have any value without breaking invariants, make the field public.
-Conversely, if there is an invariant, document it, enforce it in the "constructor" function, make the field private, and provide a getter.
-Never provide setters.
-
-Getters should return borrowed data:
-
-```
-struct Person {
-    // Invariant: never empty
-    first_name: String,
-    middle_name: Option<String>
-}
-
-// Good
-impl Person {
-    fn first_name(&self) -> &str { self.first_name.as_str() }
-    fn middle_name(&self) -> Option<&str> { self.middle_name.as_ref() }
-}
-
-// Not as good
-impl Person {
-    fn first_name(&self) -> String { self.first_name.clone() }
-    fn middle_name(&self) -> &Option<String> { &self.middle_name }
-}
-```
-
-
-# Premature Pessimization
-
-Avoid writing code which is slower than it needs to be.
-Don't allocate a `Vec` where an iterator would do, don't allocate strings needlessly.
+Use `<`/`<=`, avoid `>`/`>=`.
+Less-then comparisons are more intuitive, they correspond spatially to [real line](https://en.wikipedia.org/wiki/Real_line)
 
 ```rust
 // Good
-use itertools::Itertools;
-
-let (first_word, second_word) = match text.split_ascii_whitespace().collect_tuple() {
-    Some(it) => it,
-    None => return,
-}
+assert!(lo <= x && x <= hi);
 
 // Not as good
-let words = text.split_ascii_whitespace().collect::<Vec<_>>();
-if words.len() != 2 {
-    return
-}
+assert!(x >= lo && x <= hi>);
 ```
 
-# Documentation
+## Documentation
 
 For `.md` and `.adoc` files, prefer a sentence-per-line format, don't wrap lines.
 If the line is too long, you want to split the sentence in two :-)
-
-# Commit Style
-
-We don't have specific rules around git history hygiene.
-Maintaining clean git history is strongly encouraged, but not enforced.
-Use rebase workflow, it's OK to rewrite history during PR review process.
-After you are happy with the state of the code, please use [interactive rebase](https://git-scm.com/book/en/v2/Git-Tools-Rewriting-History) to squash fixup commits.
-
-Avoid @mentioning people in commit messages and pull request descriptions(they are added to commit message by bors).
-Such messages create a lot of duplicate notification traffic during rebases.

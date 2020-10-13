@@ -11,14 +11,15 @@ use ide::{
     FileId, FilePosition, FileRange, HoverAction, HoverGotoTypeData, NavigationTarget, Query,
     RangeInfo, Runnable, RunnableKind, SearchScope, TextEdit,
 };
+use itertools::Itertools;
 use lsp_server::ErrorCode;
 use lsp_types::{
     CallHierarchyIncomingCall, CallHierarchyIncomingCallsParams, CallHierarchyItem,
     CallHierarchyOutgoingCall, CallHierarchyOutgoingCallsParams, CallHierarchyPrepareParams,
     CodeActionKind, CodeLens, Command, CompletionItem, Diagnostic, DocumentFormattingParams,
     DocumentHighlight, DocumentSymbol, FoldingRange, FoldingRangeParams, HoverContents, Location,
-    Position, PrepareRenameResponse, Range, RenameParams, SemanticTokensEditResult,
-    SemanticTokensEditsParams, SemanticTokensParams, SemanticTokensRangeParams,
+    Position, PrepareRenameResponse, Range, RenameParams, SemanticTokensDeltaParams,
+    SemanticTokensFullDeltaResult, SemanticTokensParams, SemanticTokensRangeParams,
     SemanticTokensRangeResult, SemanticTokensResult, SymbolInformation, SymbolTag,
     TextDocumentIdentifier, Url, WorkspaceEdit,
 };
@@ -37,10 +38,22 @@ use crate::{
     to_proto, LspError, Result,
 };
 
-pub(crate) fn handle_analyzer_status(snap: GlobalStateSnapshot, _: ()) -> Result<String> {
+pub(crate) fn handle_analyzer_status(
+    snap: GlobalStateSnapshot,
+    params: lsp_ext::AnalyzerStatusParams,
+) -> Result<String> {
     let _p = profile::span("handle_analyzer_status");
 
     let mut buf = String::new();
+
+    let mut file_id = None;
+    if let Some(tdi) = params.text_document {
+        match from_proto::file_id(&snap, &tdi.uri) {
+            Ok(it) => file_id = Some(it),
+            Err(_) => format_to!(buf, "file {} not found in vfs", tdi.uri),
+        }
+    }
+
     if snap.workspaces.is_empty() {
         buf.push_str("no workspaces\n")
     } else {
@@ -51,7 +64,10 @@ pub(crate) fn handle_analyzer_status(snap: GlobalStateSnapshot, _: ()) -> Result
     }
     buf.push_str("\nanalysis:\n");
     buf.push_str(
-        &snap.analysis.status().unwrap_or_else(|_| "Analysis retrieval was cancelled".to_owned()),
+        &snap
+            .analysis
+            .status(file_id)
+            .unwrap_or_else(|_| "Analysis retrieval was cancelled".to_owned()),
     );
     format_to!(buf, "\n\nrequests:\n");
     let requests = snap.latest_requests.read();
@@ -475,6 +491,7 @@ pub(crate) fn handle_runnables(
     }
 
     // Add `cargo check` and `cargo test` for all targets of the whole package
+    let config = &snap.config.runnables;
     match cargo_spec {
         Some(spec) => {
             for &cmd in ["check", "test"].iter() {
@@ -484,12 +501,14 @@ pub(crate) fn handle_runnables(
                     kind: lsp_ext::RunnableKind::Cargo,
                     args: lsp_ext::CargoRunnable {
                         workspace_root: Some(spec.workspace_root.clone().into()),
+                        override_cargo: config.override_cargo.clone(),
                         cargo_args: vec![
                             cmd.to_string(),
                             "--package".to_string(),
                             spec.package.clone(),
                             "--all-targets".to_string(),
                         ],
+                        cargo_extra_args: config.cargo_extra_args.clone(),
                         executable_args: Vec::new(),
                         expect_test: None,
                     },
@@ -503,7 +522,9 @@ pub(crate) fn handle_runnables(
                 kind: lsp_ext::RunnableKind::Cargo,
                 args: lsp_ext::CargoRunnable {
                     workspace_root: None,
+                    override_cargo: config.override_cargo.clone(),
                     cargo_args: vec!["check".to_string(), "--workspace".to_string()],
+                    cargo_extra_args: config.cargo_extra_args.clone(),
                     executable_args: Vec::new(),
                     expect_test: None,
                 },
@@ -597,7 +618,11 @@ pub(crate) fn handle_hover(
 ) -> Result<Option<lsp_ext::Hover>> {
     let _p = profile::span("handle_hover");
     let position = from_proto::file_position(&snap, params.text_document_position_params)?;
-    let info = match snap.analysis.hover(position)? {
+    let info = match snap.analysis.hover(
+        position,
+        snap.config.hover.links_in_hover,
+        snap.config.hover.markdown,
+    )? {
         None => return Ok(None),
         Some(info) => info,
     };
@@ -621,14 +646,9 @@ pub(crate) fn handle_prepare_rename(
     let _p = profile::span("handle_prepare_rename");
     let position = from_proto::file_position(&snap, params)?;
 
-    let optional_change = snap.analysis.rename(position, "dummy")?;
-    let range = match optional_change {
-        None => return Ok(None),
-        Some(it) => it.range,
-    };
-
+    let change = snap.analysis.rename(position, "dummy")??;
     let line_index = snap.analysis.file_line_index(position.file_id)?;
-    let range = to_proto::range(&line_index, range);
+    let range = to_proto::range(&line_index, change.range);
     Ok(Some(PrepareRenameResponse::Range(range)))
 }
 
@@ -647,12 +667,8 @@ pub(crate) fn handle_rename(
         .into());
     }
 
-    let optional_change = snap.analysis.rename(position, &*params.new_name)?;
-    let source_change = match optional_change {
-        None => return Ok(None),
-        Some(it) => it.info,
-    };
-    let workspace_edit = to_proto::workspace_edit(&snap, source_change)?;
+    let change = snap.analysis.rename(position, &*params.new_name)??;
+    let workspace_edit = to_proto::workspace_edit(&snap, change.info)?;
     Ok(Some(workspace_edit))
 }
 
@@ -748,10 +764,15 @@ pub(crate) fn handle_formatting(
         }
     }
 
-    Ok(Some(vec![lsp_types::TextEdit {
-        range: Range::new(Position::new(0, 0), end_position),
-        new_text: captured_stdout,
-    }]))
+    if *file == captured_stdout {
+        // The document is already formatted correctly -- no edits needed.
+        Ok(None)
+    } else {
+        Ok(Some(vec![lsp_types::TextEdit {
+            range: Range::new(Position::new(0, 0), end_position),
+            new_text: captured_stdout,
+        }]))
+    }
 }
 
 fn handle_fixes(
@@ -947,6 +968,22 @@ pub(crate) fn handle_code_lens(
                 }),
         );
     }
+
+    if snap.config.lens.references() {
+        lenses.extend(snap.analysis.find_all_methods(file_id)?.into_iter().map(|it| {
+            let range = to_proto::range(&line_index, it.range);
+            let position = to_proto::position(&line_index, it.range.start());
+            let lens_params =
+                lsp_types::TextDocumentPositionParams::new(params.text_document.clone(), position);
+
+            CodeLens {
+                range,
+                command: None,
+                data: Some(to_value(CodeLensResolveData::References(lens_params)).unwrap()),
+            }
+        }));
+    }
+
     Ok(Some(lenses))
 }
 
@@ -954,6 +991,7 @@ pub(crate) fn handle_code_lens(
 #[serde(rename_all = "camelCase")]
 enum CodeLensResolveData {
     Impls(lsp_types::request::GotoImplementationParams),
+    References(lsp_types::TextDocumentPositionParams),
 }
 
 pub(crate) fn handle_code_lens_resolve(
@@ -983,6 +1021,34 @@ pub(crate) fn handle_code_lens_resolve(
                 code_lens.range.start,
                 locations,
             );
+            Ok(CodeLens { range: code_lens.range, command: Some(cmd), data: None })
+        }
+        Some(CodeLensResolveData::References(doc_position)) => {
+            let position = from_proto::file_position(&snap, doc_position.clone())?;
+            let locations = snap
+                .analysis
+                .find_all_refs(position, None)
+                .unwrap_or(None)
+                .map(|r| {
+                    r.references()
+                        .iter()
+                        .filter_map(|it| to_proto::location(&snap, it.file_range).ok())
+                        .collect_vec()
+                })
+                .unwrap_or_default();
+
+            let title = reference_title(locations.len());
+            let cmd = if locations.is_empty() {
+                Command { title, command: "".into(), arguments: None }
+            } else {
+                show_references_command(
+                    title,
+                    &doc_position.text_document.uri,
+                    code_lens.range.start,
+                    locations,
+                )
+            };
+
             Ok(CodeLens { range: code_lens.range, command: Some(cmd), data: None })
         }
         None => Ok(CodeLens {
@@ -1075,7 +1141,7 @@ pub(crate) fn handle_inlay_hints(
         .analysis
         .inlay_hints(file_id, &snap.config.inlay_hints)?
         .into_iter()
-        .map(|it| to_proto::inlay_int(&line_index, it))
+        .map(|it| to_proto::inlay_hint(&line_index, it))
         .collect())
 }
 
@@ -1171,11 +1237,11 @@ pub(crate) fn handle_call_hierarchy_outgoing(
     Ok(Some(res))
 }
 
-pub(crate) fn handle_semantic_tokens(
+pub(crate) fn handle_semantic_tokens_full(
     snap: GlobalStateSnapshot,
     params: SemanticTokensParams,
 ) -> Result<Option<SemanticTokensResult>> {
-    let _p = profile::span("handle_semantic_tokens");
+    let _p = profile::span("handle_semantic_tokens_full");
 
     let file_id = from_proto::file_id(&snap, &params.text_document.uri)?;
     let text = snap.analysis.file_text(file_id)?;
@@ -1190,11 +1256,11 @@ pub(crate) fn handle_semantic_tokens(
     Ok(Some(semantic_tokens.into()))
 }
 
-pub(crate) fn handle_semantic_tokens_edits(
+pub(crate) fn handle_semantic_tokens_full_delta(
     snap: GlobalStateSnapshot,
-    params: SemanticTokensEditsParams,
-) -> Result<Option<SemanticTokensEditResult>> {
-    let _p = profile::span("handle_semantic_tokens_edits");
+    params: SemanticTokensDeltaParams,
+) -> Result<Option<SemanticTokensFullDeltaResult>> {
+    let _p = profile::span("handle_semantic_tokens_full_delta");
 
     let file_id = from_proto::file_id(&snap, &params.text_document.uri)?;
     let text = snap.analysis.file_text(file_id)?;
@@ -1209,9 +1275,9 @@ pub(crate) fn handle_semantic_tokens_edits(
 
     if let Some(prev_id) = &cached_tokens.result_id {
         if *prev_id == params.previous_result_id {
-            let edits = to_proto::semantic_token_edits(&cached_tokens, &semantic_tokens);
+            let delta = to_proto::semantic_token_delta(&cached_tokens, &semantic_tokens);
             *cached_tokens = semantic_tokens;
-            return Ok(Some(edits.into()));
+            return Ok(Some(delta.into()));
         }
     }
 
@@ -1235,11 +1301,31 @@ pub(crate) fn handle_semantic_tokens_range(
     Ok(Some(semantic_tokens.into()))
 }
 
+pub(crate) fn handle_open_docs(
+    snap: GlobalStateSnapshot,
+    params: lsp_types::TextDocumentPositionParams,
+) -> Result<Option<lsp_types::Url>> {
+    let _p = profile::span("handle_open_docs");
+    let position = from_proto::file_position(&snap, params)?;
+
+    let remote = snap.analysis.external_docs(position)?;
+
+    Ok(remote.and_then(|remote| Url::parse(&remote).ok()))
+}
+
 fn implementation_title(count: usize) -> String {
     if count == 1 {
         "1 implementation".into()
     } else {
         format!("{} implementations", count)
+    }
+}
+
+fn reference_title(count: usize) -> String {
+    if count == 1 {
+        "1 reference".into()
+    } else {
+        format!("{} references", count)
     }
 }
 
@@ -1399,7 +1485,10 @@ fn should_skip_target(runnable: &Runnable, cargo_spec: Option<&CargoTargetSpec>)
         RunnableKind::Bin => {
             // Do not suggest binary run on other target than binary
             match &cargo_spec {
-                Some(spec) => !matches!(spec.target_kind, TargetKind::Bin | TargetKind::Example),
+                Some(spec) => !matches!(
+                    spec.target_kind,
+                    TargetKind::Bin | TargetKind::Example | TargetKind::Test
+                ),
                 None => true,
             }
         }

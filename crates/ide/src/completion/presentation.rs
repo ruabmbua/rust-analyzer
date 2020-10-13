@@ -1,7 +1,7 @@
 //! This modules takes care of rendering various definitions as completion items.
 //! It also handles scoring (sorting) completions.
 
-use hir::{Docs, HasAttrs, HasSource, HirDisplay, ModPath, ScopeDef, StructKind, Type};
+use hir::{HasAttrs, HasSource, HirDisplay, ModPath, ScopeDef, StructKind, Type};
 use itertools::Itertools;
 use syntax::ast::NameOwner;
 use test_utils::mark;
@@ -191,6 +191,17 @@ impl Completions {
         func: hir::Function,
         local_name: Option<String>,
     ) {
+        fn add_arg(arg: &str, ty: &Type, ctx: &CompletionContext) -> String {
+            if let Some(derefed_ty) = ty.remove_ref() {
+                for (name, local) in ctx.locals.iter() {
+                    if name == arg && local.ty(ctx.db) == derefed_ty {
+                        return (if ty.is_mutable_reference() { "&mut " } else { "&" }).to_string()
+                            + &arg.to_string();
+                    }
+                }
+            }
+            arg.to_string()
+        };
         let name = local_name.unwrap_or_else(|| func.name(ctx.db).to_string());
         let ast_node = func.source(ctx.db).value;
 
@@ -205,12 +216,20 @@ impl Completions {
                 .set_deprecated(is_deprecated(func, ctx.db))
                 .detail(function_declaration(&ast_node));
 
+        let params_ty = func.params(ctx.db);
         let params = ast_node
             .param_list()
             .into_iter()
             .flat_map(|it| it.params())
-            .flat_map(|it| it.pat())
-            .map(|pat| pat.to_string().trim_start_matches('_').into())
+            .zip(params_ty)
+            .flat_map(|(it, param_ty)| {
+                if let Some(pat) = it.pat() {
+                    let name = pat.to_string();
+                    let arg = name.trim_start_matches("mut ").trim_start_matches('_');
+                    return Some(add_arg(arg, param_ty.ty(), ctx));
+                }
+                None
+            })
             .collect();
 
         builder = builder.add_call_parens(ctx, name, Params::Named(params));
@@ -864,6 +883,106 @@ fn main() { foo(${1:foo}, ${2:bar}, ${3:ho_ge_})$0 }
     }
 
     #[test]
+    fn insert_ref_when_matching_local_in_scope() {
+        check_edit(
+            "ref_arg",
+            r#"
+struct Foo {}
+fn ref_arg(x: &Foo) {}
+fn main() {
+    let x = Foo {};
+    ref_ar<|>
+}
+"#,
+            r#"
+struct Foo {}
+fn ref_arg(x: &Foo) {}
+fn main() {
+    let x = Foo {};
+    ref_arg(${1:&x})$0
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn insert_mut_ref_when_matching_local_in_scope() {
+        check_edit(
+            "ref_arg",
+            r#"
+struct Foo {}
+fn ref_arg(x: &mut Foo) {}
+fn main() {
+    let x = Foo {};
+    ref_ar<|>
+}
+"#,
+            r#"
+struct Foo {}
+fn ref_arg(x: &mut Foo) {}
+fn main() {
+    let x = Foo {};
+    ref_arg(${1:&mut x})$0
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn insert_ref_when_matching_local_in_scope_for_method() {
+        check_edit(
+            "apply_foo",
+            r#"
+struct Foo {}
+struct Bar {}
+impl Bar {
+    fn apply_foo(&self, x: &Foo) {}
+}
+
+fn main() {
+    let x = Foo {};
+    let y = Bar {};
+    y.<|>
+}
+"#,
+            r#"
+struct Foo {}
+struct Bar {}
+impl Bar {
+    fn apply_foo(&self, x: &Foo) {}
+}
+
+fn main() {
+    let x = Foo {};
+    let y = Bar {};
+    y.apply_foo(${1:&x})$0
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn trim_mut_keyword_in_func_completion() {
+        check_edit(
+            "take_mutably",
+            r#"
+fn take_mutably(mut x: &i32) {}
+
+fn main() {
+    take_m<|>
+}
+"#,
+            r#"
+fn take_mutably(mut x: &i32) {}
+
+fn main() {
+    take_mutably(${1:x})$0
+}
+"#,
+        );
+    }
+
+    #[test]
     fn inserts_parens_for_tuple_enums() {
         mark::check!(inserts_parens_for_tuple_enums);
         check_edit(
@@ -1053,9 +1172,9 @@ fn foo(xs: Vec<i128>)
         check_edit(
             "frobnicate!",
             r#"
-//- /main.rs
+//- /main.rs crate:main deps:foo
 use foo::<|>;
-//- /foo/lib.rs
+//- /foo/lib.rs crate:foo
 #[macro_export]
 macro_rules frobnicate { () => () }
 "#,

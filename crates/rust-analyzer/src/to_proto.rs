@@ -285,16 +285,22 @@ pub(crate) fn signature_help(
         })
     };
 
-    let signature =
-        lsp_types::SignatureInformation { label, documentation, parameters: Some(parameters) };
+    let active_parameter = call_info.active_parameter.map(|it| it as i64);
+
+    let signature = lsp_types::SignatureInformation {
+        label,
+        documentation,
+        parameters: Some(parameters),
+        active_parameter,
+    };
     lsp_types::SignatureHelp {
         signatures: vec![signature],
         active_signature: None,
-        active_parameter: call_info.active_parameter.map(|it| it as i64),
+        active_parameter,
     }
 }
 
-pub(crate) fn inlay_int(line_index: &LineIndex, inlay_hint: InlayHint) -> lsp_ext::InlayHint {
+pub(crate) fn inlay_hint(line_index: &LineIndex, inlay_hint: InlayHint) -> lsp_ext::InlayHint {
     lsp_ext::InlayHint {
         label: inlay_hint.label.to_string(),
         range: range(line_index, inlay_hint.range),
@@ -334,13 +340,13 @@ pub(crate) fn semantic_tokens(
     builder.build()
 }
 
-pub(crate) fn semantic_token_edits(
+pub(crate) fn semantic_token_delta(
     previous: &lsp_types::SemanticTokens,
     current: &lsp_types::SemanticTokens,
-) -> lsp_types::SemanticTokensEdits {
+) -> lsp_types::SemanticTokensDelta {
     let result_id = current.result_id.clone();
     let edits = semantic_tokens::diff_tokens(&previous.data, &current.data);
-    lsp_types::SemanticTokensEdits { result_id, edits }
+    lsp_types::SemanticTokensDelta { result_id, edits }
 }
 
 fn semantic_token_type_and_modifiers(
@@ -369,7 +375,7 @@ fn semantic_token_type_and_modifiers(
             mods |= lsp_types::SemanticTokenModifier::STATIC;
             lsp_types::SemanticTokenType::VARIABLE
         }
-        HighlightTag::EnumVariant => semantic_tokens::ENUM_MEMBER,
+        HighlightTag::EnumVariant => lsp_types::SemanticTokenType::ENUM_MEMBER,
         HighlightTag::Macro => lsp_types::SemanticTokenType::MACRO,
         HighlightTag::ValueParam => lsp_types::SemanticTokenType::PARAMETER,
         HighlightTag::Local => lsp_types::SemanticTokenType::VARIABLE,
@@ -734,6 +740,7 @@ pub(crate) fn runnable(
     file_id: FileId,
     runnable: Runnable,
 ) -> Result<lsp_ext::Runnable> {
+    let config = &snap.config.runnables;
     let spec = CargoTargetSpec::for_file(snap, file_id)?;
     let workspace_root = spec.as_ref().map(|it| it.workspace_root.clone());
     let target = spec.as_ref().map(|s| s.target.clone());
@@ -748,7 +755,9 @@ pub(crate) fn runnable(
         kind: lsp_ext::RunnableKind::Cargo,
         args: lsp_ext::CargoRunnable {
             workspace_root: workspace_root.map(|it| it.into()),
+            override_cargo: config.override_cargo.clone(),
             cargo_args,
+            cargo_extra_args: config.cargo_extra_args.clone(),
             executable_args,
             expect_test: None,
         },

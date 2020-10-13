@@ -204,6 +204,19 @@ pub(crate) fn frobnicate() {}
 }
 
 #[test]
+fn doctest_convert_integer_literal() {
+    check_doc_test(
+        "convert_integer_literal",
+        r#####"
+const _: i32 = 10<|>;
+"#####,
+        r#####"
+const _: i32 = 0b1010;
+"#####,
+    )
+}
+
+#[test]
 fn doctest_convert_to_guarded_return() {
     check_doc_test(
         "convert_to_guarded_return",
@@ -441,8 +454,8 @@ fn foo() {
     bar("", baz());
 }
 
-fn bar(arg: &str, baz: Baz) {
-    ${0:todo!()}
+fn bar(arg: &str, baz: Baz) ${0:-> ()} {
+    todo!()
 }
 
 "#####,
@@ -810,6 +823,19 @@ fn handle(action: Action) {
         _ => bar(),
     }
 }
+"#####,
+    )
+}
+
+#[test]
+fn doctest_replace_impl_trait_with_generic() {
+    check_doc_test(
+        "replace_impl_trait_with_generic",
+        r#####"
+fn foo(bar: <|>impl Bar) {}
+"#####,
+        r#####"
+fn foo<B: Bar>(bar: B) {}
 "#####,
     )
 }

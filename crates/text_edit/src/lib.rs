@@ -119,7 +119,7 @@ impl TextEdit {
             return Err(other);
         }
         self.indels.extend(other.indels);
-        assert!(check_disjoint(&mut self.indels));
+        assert_disjoint(&mut self.indels);
         Ok(())
     }
 
@@ -159,24 +159,33 @@ impl<'a> IntoIterator for &'a TextEdit {
 
 impl TextEditBuilder {
     pub fn replace(&mut self, range: TextRange, replace_with: String) {
-        self.indels.push(Indel::replace(range, replace_with))
+        self.indel(Indel::replace(range, replace_with))
     }
     pub fn delete(&mut self, range: TextRange) {
-        self.indels.push(Indel::delete(range))
+        self.indel(Indel::delete(range))
     }
     pub fn insert(&mut self, offset: TextSize, text: String) {
-        self.indels.push(Indel::insert(offset, text))
+        self.indel(Indel::insert(offset, text))
     }
     pub fn finish(self) -> TextEdit {
         let mut indels = self.indels;
-        assert!(check_disjoint(&mut indels));
+        assert_disjoint(&mut indels);
         TextEdit { indels }
     }
     pub fn invalidates_offset(&self, offset: TextSize) -> bool {
         self.indels.iter().any(|indel| indel.delete.contains_inclusive(offset))
     }
+    fn indel(&mut self, indel: Indel) {
+        self.indels.push(indel);
+        if self.indels.len() <= 16 {
+            assert_disjoint(&mut self.indels);
+        }
+    }
 }
 
+fn assert_disjoint(indels: &mut [impl std::borrow::Borrow<Indel>]) {
+    assert!(check_disjoint(indels));
+}
 fn check_disjoint(indels: &mut [impl std::borrow::Borrow<Indel>]) -> bool {
     indels.sort_by_key(|indel| (indel.borrow().delete.start(), indel.borrow().delete.end()));
     indels

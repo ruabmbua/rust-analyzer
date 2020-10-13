@@ -221,7 +221,16 @@ impl HirDisplay for ApplicationTy {
             }
             TypeCtor::RawPtr(m) => {
                 let t = self.parameters.as_single();
-                write!(f, "*{}{}", m.as_keyword_for_ptr(), t.display(f.db))?;
+                let ty_display = t.display(f.db);
+
+                write!(f, "*{}", m.as_keyword_for_ptr())?;
+                if matches!(t, Ty::Dyn(predicates) if predicates.len() > 1) {
+                    write!(f, "(")?;
+                    write!(f, "{}", ty_display)?;
+                    write!(f, ")")?;
+                } else {
+                    write!(f, "{}", ty_display)?;
+                }
             }
             TypeCtor::Ref(m) => {
                 let t = self.parameters.as_single();
@@ -230,7 +239,15 @@ impl HirDisplay for ApplicationTy {
                 } else {
                     t.display(f.db)
                 };
-                write!(f, "&{}{}", m.as_keyword_for_ref(), ty_display)?;
+
+                write!(f, "&{}", m.as_keyword_for_ref())?;
+                if matches!(t, Ty::Dyn(predicates) if predicates.len() > 1) {
+                    write!(f, "(")?;
+                    write!(f, "{}", ty_display)?;
+                    write!(f, ")")?;
+                } else {
+                    write!(f, "{}", ty_display)?;
+                }
             }
             TypeCtor::Never => write!(f, "!")?,
             TypeCtor::Tuple { .. } => {
@@ -380,20 +397,34 @@ impl HirDisplay for ApplicationTy {
                     write!(f, ">")?;
                 }
             }
+            TypeCtor::ForeignType(type_alias) => {
+                let type_alias = f.db.type_alias_data(type_alias);
+                write!(f, "{}", type_alias.name)?;
+                if self.parameters.len() > 0 {
+                    write!(f, "<")?;
+                    f.write_joined(&*self.parameters.0, ", ")?;
+                    write!(f, ">")?;
+                }
+            }
             TypeCtor::OpaqueType(opaque_ty_id) => {
-                let bounds = match opaque_ty_id {
+                match opaque_ty_id {
                     OpaqueTyId::ReturnTypeImplTrait(func, idx) => {
                         let datas =
                             f.db.return_type_impl_traits(func).expect("impl trait id without data");
                         let data = (*datas)
                             .as_ref()
                             .map(|rpit| rpit.impl_traits[idx as usize].bounds.clone());
-                        data.subst(&self.parameters)
+                        let bounds = data.subst(&self.parameters);
+                        write!(f, "impl ")?;
+                        write_bounds_like_dyn_trait(&bounds.value, f)?;
+                        // FIXME: it would maybe be good to distinguish this from the alias type (when debug printing), and to show the substitution
                     }
-                };
-                write!(f, "impl ")?;
-                write_bounds_like_dyn_trait(&bounds.value, f)?;
-                // FIXME: it would maybe be good to distinguish this from the alias type (when debug printing), and to show the substitution
+                    OpaqueTyId::AsyncBlockTypeImplTrait(..) => {
+                        write!(f, "impl Future<Output = ")?;
+                        self.parameters[0].hir_fmt(f)?;
+                        write!(f, ">")?;
+                    }
+                }
             }
             TypeCtor::Closure { .. } => {
                 let sig = self.parameters[0].callable_sig(f.db);
@@ -474,18 +505,21 @@ impl HirDisplay for Ty {
                 write_bounds_like_dyn_trait(predicates, f)?;
             }
             Ty::Opaque(opaque_ty) => {
-                let bounds = match opaque_ty.opaque_ty_id {
+                match opaque_ty.opaque_ty_id {
                     OpaqueTyId::ReturnTypeImplTrait(func, idx) => {
                         let datas =
                             f.db.return_type_impl_traits(func).expect("impl trait id without data");
                         let data = (*datas)
                             .as_ref()
                             .map(|rpit| rpit.impl_traits[idx as usize].bounds.clone());
-                        data.subst(&opaque_ty.parameters)
+                        let bounds = data.subst(&opaque_ty.parameters);
+                        write!(f, "impl ")?;
+                        write_bounds_like_dyn_trait(&bounds.value, f)?;
+                    }
+                    OpaqueTyId::AsyncBlockTypeImplTrait(..) => {
+                        write!(f, "{{async block}}")?;
                     }
                 };
-                write!(f, "impl ")?;
-                write_bounds_like_dyn_trait(&bounds.value, f)?;
             }
             Ty::Unknown => write!(f, "{{unknown}}")?,
             Ty::Infer(..) => write!(f, "_")?,
@@ -619,14 +653,14 @@ impl HirDisplay for GenericPredicate {
 
 impl HirDisplay for Obligation {
     fn hir_fmt(&self, f: &mut HirFormatter) -> Result<(), HirDisplayError> {
-        Ok(match self {
-            Obligation::Trait(tr) => write!(f, "Implements({})", tr.display(f.db))?,
+        match self {
+            Obligation::Trait(tr) => write!(f, "Implements({})", tr.display(f.db)),
             Obligation::Projection(proj) => write!(
                 f,
                 "Normalize({} => {})",
                 proj.projection_ty.display(f.db),
                 proj.ty.display(f.db)
-            )?,
-        })
+            ),
+        }
     }
 }

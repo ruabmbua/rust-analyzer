@@ -7,9 +7,12 @@ use std::{
 
 use base_db::VfsPath;
 use crossbeam_channel::{select, Receiver};
+use ide::PrimeCachesProgress;
 use ide::{Canceled, FileId};
 use lsp_server::{Connection, Notification, Request, Response};
 use lsp_types::notification::Notification as _;
+use project_model::ProjectWorkspace;
+use vfs::ChangeKind;
 
 use crate::{
     config::Config,
@@ -21,8 +24,6 @@ use crate::{
     lsp_utils::{apply_document_changes, is_canceled, notification_is, Progress},
     Result,
 };
-use project_model::ProjectWorkspace;
-use vfs::ChangeKind;
 
 pub fn main_loop(config: Config, connection: Connection) -> Result<()> {
     log::info!("initial config: {:#?}", config);
@@ -61,7 +62,7 @@ pub(crate) enum Task {
     Response(Response),
     Diagnostics(Vec<(FileId, Vec<lsp_types::Diagnostic>)>),
     Workspaces(Vec<anyhow::Result<ProjectWorkspace>>),
-    Unit,
+    PrimeCaches(PrimeCachesProgress),
 }
 
 impl fmt::Debug for Event {
@@ -175,9 +176,9 @@ impl GlobalState {
         let _p = profile::span("GlobalState::handle_event");
 
         log::info!("handle_event({:?})", event);
-        let queue_count = self.task_pool.handle.len();
-        if queue_count > 0 {
-            log::info!("queued count = {}", queue_count);
+        let task_queue_len = self.task_pool.handle.len();
+        if task_queue_len > 0 {
+            log::info!("task queue len: {}", task_queue_len);
         }
 
         let prev_status = self.status;
@@ -189,19 +190,37 @@ impl GlobalState {
                 }
                 lsp_server::Message::Response(resp) => self.complete_request(resp),
             },
-            Event::Task(task) => {
-                match task {
-                    Task::Response(response) => self.respond(response),
-                    Task::Diagnostics(diagnostics_per_file) => {
-                        for (file_id, diagnostics) in diagnostics_per_file {
-                            self.diagnostics.set_native_diagnostics(file_id, diagnostics)
-                        }
+            Event::Task(task) => match task {
+                Task::Response(response) => self.respond(response),
+                Task::Diagnostics(diagnostics_per_file) => {
+                    for (file_id, diagnostics) in diagnostics_per_file {
+                        self.diagnostics.set_native_diagnostics(file_id, diagnostics)
                     }
-                    Task::Workspaces(workspaces) => self.switch_workspaces(workspaces),
-                    Task::Unit => (),
                 }
-                self.analysis_host.maybe_collect_garbage();
-            }
+                Task::Workspaces(workspaces) => self.switch_workspaces(workspaces),
+                Task::PrimeCaches(progress) => {
+                    let (state, message, fraction);
+                    match progress {
+                        PrimeCachesProgress::Started => {
+                            state = Progress::Begin;
+                            message = None;
+                            fraction = 0.0;
+                        }
+                        PrimeCachesProgress::StartedOnCrate { on_crate, n_done, n_total } => {
+                            state = Progress::Report;
+                            message = Some(format!("{}/{} ({})", n_done, n_total, on_crate));
+                            fraction = Progress::fraction(n_done, n_total);
+                        }
+                        PrimeCachesProgress::Finished => {
+                            state = Progress::End;
+                            message = None;
+                            fraction = 1.0;
+                        }
+                    };
+
+                    self.report_progress("indexing", state, message, Some(fraction));
+                }
+            },
             Event::Vfs(mut task) => {
                 let _p = profile::span("GlobalState::handle_event/vfs");
                 loop {
@@ -233,7 +252,7 @@ impl GlobalState {
                                     "roots scanned",
                                     state,
                                     Some(format!("{}/{}", n_done, n_total)),
-                                    Some(Progress::percentage(n_done, n_total)),
+                                    Some(Progress::fraction(n_done, n_total)),
                                 )
                             }
                         }
@@ -266,8 +285,8 @@ impl GlobalState {
                     }
                 }
 
-                flycheck::Message::Progress(status) => {
-                    let (state, message) = match status {
+                flycheck::Message::Progress { id, progress } => {
+                    let (state, message) = match progress {
                         flycheck::Progress::DidStart => {
                             self.diagnostics.clear_check();
                             (Progress::Begin, None)
@@ -284,14 +303,21 @@ impl GlobalState {
                         }
                     };
 
-                    self.report_progress("cargo check", state, message, None);
+                    // When we're running multiple flychecks, we have to include a disambiguator in
+                    // the title, or the editor complains. Note that this is a user-facing string.
+                    let title = if self.flycheck.len() == 1 {
+                        "cargo check".to_string()
+                    } else {
+                        format!("cargo check (#{})", id + 1)
+                    };
+                    self.report_progress(&title, state, message, None);
                 }
             },
         }
 
         let state_changed = self.process_changes();
         if prev_status == Status::Loading && self.status == Status::Ready {
-            if let Some(flycheck) = &self.flycheck {
+            for flycheck in &self.flycheck {
                 flycheck.update();
             }
         }
@@ -380,6 +406,7 @@ impl GlobalState {
             .on::<lsp_ext::CodeActionRequest>(handlers::handle_code_action)?
             .on::<lsp_ext::ResolveCodeActionRequest>(handlers::handle_resolve_code_action)?
             .on::<lsp_ext::HoverRequest>(handlers::handle_hover)?
+            .on::<lsp_ext::ExternalDocs>(handlers::handle_open_docs)?
             .on::<lsp_types::request::OnTypeFormatting>(handlers::handle_on_type_formatting)?
             .on::<lsp_types::request::DocumentSymbolRequest>(handlers::handle_document_symbol)?
             .on::<lsp_types::request::WorkspaceSymbol>(handlers::handle_workspace_symbol)?
@@ -407,9 +434,11 @@ impl GlobalState {
             .on::<lsp_types::request::CallHierarchyOutgoingCalls>(
                 handlers::handle_call_hierarchy_outgoing,
             )?
-            .on::<lsp_types::request::SemanticTokensRequest>(handlers::handle_semantic_tokens)?
-            .on::<lsp_types::request::SemanticTokensEditsRequest>(
-                handlers::handle_semantic_tokens_edits,
+            .on::<lsp_types::request::SemanticTokensFullRequest>(
+                handlers::handle_semantic_tokens_full,
+            )?
+            .on::<lsp_types::request::SemanticTokensFullDeltaRequest>(
+                handlers::handle_semantic_tokens_full_delta,
             )?
             .on::<lsp_types::request::SemanticTokensRangeRequest>(
                 handlers::handle_semantic_tokens_range,
@@ -488,7 +517,7 @@ impl GlobalState {
                 Ok(())
             })?
             .on::<lsp_types::notification::DidSaveTextDocument>(|this, params| {
-                if let Some(flycheck) = &this.flycheck {
+                for flycheck in &this.flycheck {
                     flycheck.update();
                 }
                 if let Ok(abs_path) = from_proto::abs_path(&params.text_document.uri) {
@@ -566,12 +595,18 @@ impl GlobalState {
                 Task::Diagnostics(diagnostics)
             })
         }
-        self.task_pool.handle.spawn({
-            let subs = subscriptions;
+        self.task_pool.handle.spawn_with_sender({
             let snap = self.snapshot();
-            move || {
-                snap.analysis.prime_caches(subs).unwrap_or_else(|_: Canceled| ());
-                Task::Unit
+            move |sender| {
+                snap.analysis
+                    .prime_caches(|progress| {
+                        sender.send(Task::PrimeCaches(progress)).unwrap();
+                    })
+                    .unwrap_or_else(|_: Canceled| {
+                        // Pretend that we're done, so that the progress bar is removed. Otherwise
+                        // the editor may complain about it already existing.
+                        sender.send(Task::PrimeCaches(PrimeCachesProgress::Finished)).unwrap()
+                    });
             }
         });
     }

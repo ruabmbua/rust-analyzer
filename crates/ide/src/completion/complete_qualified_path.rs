@@ -13,7 +13,7 @@ pub(super) fn complete_qualified_path(acc: &mut Completions, ctx: &CompletionCon
         None => return,
     };
 
-    if ctx.attribute_under_caret.is_some() {
+    if ctx.attribute_under_caret.is_some() || ctx.mod_declaration_under_caret.is_some() {
         return;
     }
 
@@ -422,10 +422,10 @@ fn foo() { let _ = U::<|> }
     fn completes_use_paths_across_crates() {
         check(
             r#"
-//- /main.rs
+//- /main.rs crate:main deps:foo
 use foo::<|>;
 
-//- /foo/lib.rs
+//- /foo/lib.rs crate:foo
 pub mod bar { pub struct S; }
 "#,
             expect![[r#"
@@ -728,6 +728,28 @@ mod foo { pub struct Foo; }
 fn f() {}
 "#,
             expect![[""]],
+        );
+    }
+
+    #[test]
+    fn completes_function() {
+        check(
+            r#"
+fn foo(
+    a: i32,
+    b: i32
+) {
+
+}
+
+fn main() {
+    fo<|>
+}
+"#,
+            expect![[r#"
+                fn foo(…) fn foo(a: i32, b: i32)
+                fn main() fn main()
+            "#]],
         );
     }
 }

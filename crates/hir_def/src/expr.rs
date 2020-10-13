@@ -111,6 +111,9 @@ pub enum Expr {
     TryBlock {
         body: ExprId,
     },
+    Async {
+        body: ExprId,
+    },
     Cast {
         expr: ExprId,
         type_ref: TypeRef,
@@ -250,7 +253,7 @@ impl Expr {
                     f(*expr);
                 }
             }
-            Expr::TryBlock { body } | Expr::Unsafe { body } => f(*body),
+            Expr::TryBlock { body } | Expr::Unsafe { body } | Expr::Async { body } => f(*body),
             Expr::Loop { body, .. } => f(*body),
             Expr::While { condition, body, .. } => {
                 f(*condition);
@@ -395,6 +398,7 @@ pub enum Pat {
     Bind { mode: BindingAnnotation, name: Name, subpat: Option<PatId> },
     TupleStruct { path: Option<Path>, args: Vec<PatId>, ellipsis: Option<usize> },
     Ref { pat: PatId, mutability: Mutability },
+    Box { inner: PatId },
 }
 
 impl Pat {
@@ -415,6 +419,7 @@ impl Pat {
             Pat::Record { args, .. } => {
                 args.iter().map(|f| f.pat).for_each(f);
             }
+            Pat::Box { inner } => f(*inner),
         }
     }
 }

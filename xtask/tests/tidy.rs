@@ -38,6 +38,13 @@ fn check_code_formatting() {
 }
 
 #[test]
+fn smoke_test_docs_generation() {
+    // We don't commit docs to the repo, so we can just overwrite in tests.
+    codegen::generate_assists_docs(Mode::Overwrite).unwrap();
+    codegen::generate_feature_docs(Mode::Overwrite).unwrap();
+}
+
+#[test]
 fn rust_files_are_tidy() {
     let mut tidy_docs = TidyDocs::default();
     for path in rust_files(&project_root().join("crates")) {
@@ -48,6 +55,42 @@ fn rust_files_are_tidy() {
         tidy_docs.visit(&path, &text);
     }
     tidy_docs.finish();
+}
+
+#[test]
+fn check_merge_commits() {
+    let stdout = run!("git rev-list --merges --invert-grep --author 'bors\\[bot\\]' HEAD~19.."; echo = false)
+        .unwrap();
+    if !stdout.is_empty() {
+        panic!(
+            "
+Merge commits are not allowed in the history.
+
+When updating a pull-request, please rebase your feature branch
+on top of master by running `git rebase master`. If rebase fails,
+you can re-apply your changes like this:
+
+  # Abort in-progress rebase, if any.
+  $ git rebase --abort
+
+  # Make the branch point to the latest commit from master,
+  # while maintaining your local changes uncommited.
+  $ git reset --soft origin/master
+
+  # Commit all changes in a single batch.
+  $ git commit -am'My changes'
+
+  # Push the changes. We did a rebase, so we need `--force` option.
+  # `--force-with-lease` is a more safe (Rusty) version of `--force`.
+  $ git push --force-with-lease
+
+And don't fear to mess something up during a rebase -- you can
+always restore the previous state using `git ref-log`:
+
+https://github.blog/2015-06-08-how-to-undo-almost-anything-with-git/#redo-after-undo-local
+"
+        );
+    }
 }
 
 fn deny_clippy(path: &PathBuf, text: &String) {
@@ -68,8 +111,10 @@ See https://github.com/rust-lang/rust-clippy/issues/5537 for discussion.
 fn check_licenses() {
     let expected = "
 0BSD OR MIT OR Apache-2.0
+Apache-2.0
 Apache-2.0 OR BSL-1.0
 Apache-2.0 OR MIT
+Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT
 Apache-2.0/MIT
 BSD-2-Clause
 BSD-3-Clause
@@ -78,8 +123,8 @@ ISC
 MIT
 MIT / Apache-2.0
 MIT OR Apache-2.0
+MIT OR Zlib OR Apache-2.0
 MIT/Apache-2.0
-MIT/Apache-2.0 AND BSD-2-Clause
 Unlicense OR MIT
 Unlicense/MIT
 Zlib OR Apache-2.0 OR MIT

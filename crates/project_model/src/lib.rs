@@ -6,6 +6,7 @@ mod sysroot;
 mod cfg_flag;
 
 use std::{
+    fmt,
     fs::{self, read_dir, ReadDir},
     io,
     process::Command,
@@ -27,12 +28,32 @@ pub use crate::{
 
 pub use proc_macro_api::ProcMacroClient;
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub enum ProjectWorkspace {
     /// Project workspace was discovered by running `cargo metadata` and `rustc --print sysroot`.
     Cargo { cargo: CargoWorkspace, sysroot: Sysroot },
     /// Project workspace was manually specified using a `rust-project.json` file.
-    Json { project: ProjectJson },
+    Json { project: ProjectJson, sysroot: Option<Sysroot> },
+}
+
+impl fmt::Debug for ProjectWorkspace {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ProjectWorkspace::Cargo { cargo, sysroot } => f
+                .debug_struct("Cargo")
+                .field("n_packages", &cargo.packages().len())
+                .field("n_sysroot_crates", &sysroot.crates().len())
+                .finish(),
+            ProjectWorkspace::Json { project, sysroot } => {
+                let mut debug_struct = f.debug_struct("Json");
+                debug_struct.field("n_crates", &project.n_crates());
+                if let Some(sysroot) = sysroot {
+                    debug_struct.field("n_sysroot_crates", &sysroot.crates().len());
+                }
+                debug_struct.finish()
+            }
+        }
+    }
 }
 
 /// `PackageRoot` describes a package root folder.
@@ -148,7 +169,11 @@ impl ProjectWorkspace {
                 })?;
                 let project_location = project_json.parent().unwrap().to_path_buf();
                 let project = ProjectJson::new(&project_location, data);
-                ProjectWorkspace::Json { project }
+                let sysroot = match &project.sysroot_src {
+                    Some(path) => Some(Sysroot::load(path)?),
+                    None => None,
+                };
+                ProjectWorkspace::Json { project, sysroot }
             }
             ProjectManifest::CargoToml(cargo_toml) => {
                 let cargo_version = utf8_stdout({
@@ -182,21 +207,36 @@ impl ProjectWorkspace {
         Ok(res)
     }
 
+    pub fn load_inline(project_json: ProjectJson) -> Result<ProjectWorkspace> {
+        let sysroot = match &project_json.sysroot_src {
+            Some(path) => Some(Sysroot::load(path)?),
+            None => None,
+        };
+
+        Ok(ProjectWorkspace::Json { project: project_json, sysroot })
+    }
+
     /// Returns the roots for the current `ProjectWorkspace`
     /// The return type contains the path and whether or not
     /// the root is a member of the current workspace
     pub fn to_roots(&self) -> Vec<PackageRoot> {
         match self {
-            ProjectWorkspace::Json { project } => project
-                .crates
-                .iter()
-                .map(|krate| PackageRoot {
+            ProjectWorkspace::Json { project, sysroot } => project
+                .crates()
+                .map(|(_, krate)| PackageRoot {
                     is_member: krate.is_workspace_member,
                     include: krate.include.clone(),
                     exclude: krate.exclude.clone(),
                 })
                 .collect::<FxHashSet<_>>()
                 .into_iter()
+                .chain(sysroot.as_ref().into_iter().flat_map(|sysroot| {
+                    sysroot.crates().map(move |krate| PackageRoot {
+                        is_member: false,
+                        include: vec![sysroot[krate].root_dir().to_path_buf()],
+                        exclude: Vec::new(),
+                    })
+                }))
                 .collect::<Vec<_>>(),
             ProjectWorkspace::Cargo { cargo, sysroot } => cargo
                 .packages()
@@ -228,10 +268,9 @@ impl ProjectWorkspace {
 
     pub fn proc_macro_dylib_paths(&self) -> Vec<AbsPathBuf> {
         match self {
-            ProjectWorkspace::Json { project } => project
-                .crates
-                .iter()
-                .filter_map(|krate| krate.proc_macro_dylib_path.as_ref())
+            ProjectWorkspace::Json { project, sysroot: _ } => project
+                .crates()
+                .filter_map(|(_, krate)| krate.proc_macro_dylib_path.as_ref())
                 .cloned()
                 .collect(),
             ProjectWorkspace::Cargo { cargo, sysroot: _sysroot } => cargo
@@ -244,7 +283,7 @@ impl ProjectWorkspace {
 
     pub fn n_packages(&self) -> usize {
         match self {
-            ProjectWorkspace::Json { project, .. } => project.crates.len(),
+            ProjectWorkspace::Json { project, .. } => project.n_crates(),
             ProjectWorkspace::Cargo { cargo, sysroot } => {
                 cargo.packages().len() + sysroot.crates().len()
             }
@@ -259,15 +298,23 @@ impl ProjectWorkspace {
     ) -> CrateGraph {
         let mut crate_graph = CrateGraph::default();
         match self {
-            ProjectWorkspace::Json { project } => {
+            ProjectWorkspace::Json { project, sysroot } => {
+                let sysroot_dps = sysroot
+                    .as_ref()
+                    .map(|sysroot| sysroot_to_crate_graph(&mut crate_graph, sysroot, target, load));
+
                 let mut cfg_cache: FxHashMap<Option<&str>, Vec<CfgFlag>> = FxHashMap::default();
                 let crates: FxHashMap<_, _> = project
-                    .crates
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(seq_index, krate)| {
+                    .crates()
+                    .filter_map(|(crate_id, krate)| {
                         let file_path = &krate.root_module;
-                        let file_id = load(&file_path)?;
+                        let file_id = match load(&file_path) {
+                            Some(id) => id,
+                            None => {
+                                log::error!("failed to load crate root {}", file_path.display());
+                                return None;
+                            }
+                        };
 
                         let env = krate.env.clone().into_iter().collect();
                         let proc_macro = krate
@@ -283,9 +330,8 @@ impl ProjectWorkspace {
                         let mut cfg_options = CfgOptions::default();
                         cfg_options.extend(target_cfgs.iter().chain(krate.cfg.iter()).cloned());
 
-                        // FIXME: No crate name in json definition such that we cannot add OUT_DIR to env
                         Some((
-                            CrateId(seq_index as u32),
+                            crate_id,
                             crate_graph.add_crate_root(
                                 file_id,
                                 krate.edition,
@@ -299,67 +345,33 @@ impl ProjectWorkspace {
                     })
                     .collect();
 
-                for (id, krate) in project.crates.iter().enumerate() {
-                    for dep in &krate.deps {
-                        let from_crate_id = CrateId(id as u32);
-                        let to_crate_id = dep.crate_id;
-                        if let (Some(&from), Some(&to)) =
-                            (crates.get(&from_crate_id), crates.get(&to_crate_id))
-                        {
-                            if crate_graph.add_dep(from, dep.name.clone(), to).is_err() {
-                                log::error!(
-                                    "cyclic dependency {:?} -> {:?}",
-                                    from_crate_id,
-                                    to_crate_id
-                                );
+                for (from, krate) in project.crates() {
+                    if let Some(&from) = crates.get(&from) {
+                        if let Some((public_deps, _proc_macro)) = &sysroot_dps {
+                            for (name, to) in public_deps.iter() {
+                                if let Err(_) = crate_graph.add_dep(from, name.clone(), *to) {
+                                    log::error!("cyclic dependency on {} for {:?}", name, from)
+                                }
+                            }
+                        }
+
+                        for dep in &krate.deps {
+                            let to_crate_id = dep.crate_id;
+                            if let Some(&to) = crates.get(&to_crate_id) {
+                                if let Err(_) = crate_graph.add_dep(from, dep.name.clone(), to) {
+                                    log::error!("cyclic dependency {:?} -> {:?}", from, to);
+                                }
                             }
                         }
                     }
                 }
             }
             ProjectWorkspace::Cargo { cargo, sysroot } => {
+                let (public_deps, libproc_macro) =
+                    sysroot_to_crate_graph(&mut crate_graph, sysroot, target, load);
+
                 let mut cfg_options = CfgOptions::default();
                 cfg_options.extend(get_rustc_cfg_options(target));
-
-                let sysroot_crates: FxHashMap<_, _> = sysroot
-                    .crates()
-                    .filter_map(|krate| {
-                        let file_id = load(&sysroot[krate].root)?;
-
-                        let env = Env::default();
-                        let proc_macro = vec![];
-                        let name = sysroot[krate].name.clone();
-                        let crate_id = crate_graph.add_crate_root(
-                            file_id,
-                            Edition::Edition2018,
-                            Some(name),
-                            cfg_options.clone(),
-                            env,
-                            proc_macro,
-                        );
-                        Some((krate, crate_id))
-                    })
-                    .collect();
-
-                for from in sysroot.crates() {
-                    for &to in sysroot[from].deps.iter() {
-                        let name = &sysroot[to].name;
-                        if let (Some(&from), Some(&to)) =
-                            (sysroot_crates.get(&from), sysroot_crates.get(&to))
-                        {
-                            if crate_graph.add_dep(from, CrateName::new(name).unwrap(), to).is_err()
-                            {
-                                log::error!("cyclic dependency between sysroot crates")
-                            }
-                        }
-                    }
-                }
-
-                let libcore = sysroot.core().and_then(|it| sysroot_crates.get(&it).copied());
-                let liballoc = sysroot.alloc().and_then(|it| sysroot_crates.get(&it).copied());
-                let libstd = sysroot.std().and_then(|it| sysroot_crates.get(&it).copied());
-                let libproc_macro =
-                    sysroot.proc_macro().and_then(|it| sysroot_crates.get(&it).copied());
 
                 let mut pkg_to_lib_crate = FxHashMap::default();
                 let mut pkg_crates = FxHashMap::default();
@@ -399,7 +411,7 @@ impl ProjectWorkspace {
                             let crate_id = crate_graph.add_crate_root(
                                 file_id,
                                 edition,
-                                Some(cargo[pkg].name.clone()),
+                                Some(CrateName::normalize_dashes(&cargo[pkg].name)),
                                 cfg_options,
                                 env,
                                 proc_macro.clone(),
@@ -410,14 +422,11 @@ impl ProjectWorkspace {
                             }
                             if cargo[tgt].is_proc_macro {
                                 if let Some(proc_macro) = libproc_macro {
-                                    if crate_graph
-                                        .add_dep(
-                                            crate_id,
-                                            CrateName::new("proc_macro").unwrap(),
-                                            proc_macro,
-                                        )
-                                        .is_err()
-                                    {
+                                    if let Err(_) = crate_graph.add_dep(
+                                        crate_id,
+                                        CrateName::new("proc_macro").unwrap(),
+                                        proc_macro,
+                                    ) {
                                         log::error!(
                                             "cyclic dependency on proc_macro for {}",
                                             &cargo[pkg].name
@@ -433,50 +442,24 @@ impl ProjectWorkspace {
                     // Set deps to the core, std and to the lib target of the current package
                     for &from in pkg_crates.get(&pkg).into_iter().flatten() {
                         if let Some((to, name)) = lib_tgt.clone() {
-                            if to != from
-                                && crate_graph
-                                    .add_dep(
-                                        from,
-                                        // For root projects with dashes in their name,
-                                        // cargo metadata does not do any normalization,
-                                        // so we do it ourselves currently
-                                        CrateName::normalize_dashes(&name),
-                                        to,
-                                    )
-                                    .is_err()
-                            {
-                                {
-                                    log::error!(
-                                        "cyclic dependency between targets of {}",
-                                        &cargo[pkg].name
-                                    )
-                                }
+                            // For root projects with dashes in their name,
+                            // cargo metadata does not do any normalization,
+                            // so we do it ourselves currently
+                            let name = CrateName::normalize_dashes(&name);
+                            if to != from && crate_graph.add_dep(from, name, to).is_err() {
+                                log::error!(
+                                    "cyclic dependency between targets of {}",
+                                    &cargo[pkg].name
+                                )
                             }
                         }
-                        // core is added as a dependency before std in order to
-                        // mimic rustcs dependency order
-                        if let Some(core) = libcore {
-                            if crate_graph
-                                .add_dep(from, CrateName::new("core").unwrap(), core)
-                                .is_err()
-                            {
-                                log::error!("cyclic dependency on core for {}", &cargo[pkg].name)
-                            }
-                        }
-                        if let Some(alloc) = liballoc {
-                            if crate_graph
-                                .add_dep(from, CrateName::new("alloc").unwrap(), alloc)
-                                .is_err()
-                            {
-                                log::error!("cyclic dependency on alloc for {}", &cargo[pkg].name)
-                            }
-                        }
-                        if let Some(std) = libstd {
-                            if crate_graph
-                                .add_dep(from, CrateName::new("std").unwrap(), std)
-                                .is_err()
-                            {
-                                log::error!("cyclic dependency on std for {}", &cargo[pkg].name)
+                        for (name, krate) in public_deps.iter() {
+                            if let Err(_) = crate_graph.add_dep(from, name.clone(), *krate) {
+                                log::error!(
+                                    "cyclic dependency on {} for {}",
+                                    name,
+                                    &cargo[pkg].name
+                                )
                             }
                         }
                     }
@@ -486,12 +469,10 @@ impl ProjectWorkspace {
                 // target of downstream.
                 for pkg in cargo.packages() {
                     for dep in cargo[pkg].dependencies.iter() {
+                        let name = CrateName::new(&dep.name).unwrap();
                         if let Some(&to) = pkg_to_lib_crate.get(&dep.pkg) {
                             for &from in pkg_crates.get(&pkg).into_iter().flatten() {
-                                if crate_graph
-                                    .add_dep(from, CrateName::new(&dep.name).unwrap(), to)
-                                    .is_err()
-                                {
+                                if let Err(_) = crate_graph.add_dep(from, name.clone(), to) {
                                     log::error!(
                                         "cyclic dependency {} -> {}",
                                         &cargo[pkg].name,
@@ -547,5 +528,54 @@ fn utf8_stdout(mut cmd: Command) -> Result<String> {
         }
     }
     let stdout = String::from_utf8(output.stdout)?;
-    Ok(stdout)
+    Ok(stdout.trim().to_string())
+}
+
+fn sysroot_to_crate_graph(
+    crate_graph: &mut CrateGraph,
+    sysroot: &Sysroot,
+    target: Option<&str>,
+    load: &mut dyn FnMut(&AbsPath) -> Option<FileId>,
+) -> (Vec<(CrateName, CrateId)>, Option<CrateId>) {
+    let mut cfg_options = CfgOptions::default();
+    cfg_options.extend(get_rustc_cfg_options(target));
+    let sysroot_crates: FxHashMap<_, _> = sysroot
+        .crates()
+        .filter_map(|krate| {
+            let file_id = load(&sysroot[krate].root)?;
+
+            let env = Env::default();
+            let proc_macro = vec![];
+            let name = CrateName::new(&sysroot[krate].name)
+                .expect("Sysroot crates' names do not contain dashes");
+            let crate_id = crate_graph.add_crate_root(
+                file_id,
+                Edition::Edition2018,
+                Some(name),
+                cfg_options.clone(),
+                env,
+                proc_macro,
+            );
+            Some((krate, crate_id))
+        })
+        .collect();
+
+    for from in sysroot.crates() {
+        for &to in sysroot[from].deps.iter() {
+            let name = CrateName::new(&sysroot[to].name).unwrap();
+            if let (Some(&from), Some(&to)) = (sysroot_crates.get(&from), sysroot_crates.get(&to)) {
+                if let Err(_) = crate_graph.add_dep(from, name, to) {
+                    log::error!("cyclic dependency between sysroot crates")
+                }
+            }
+        }
+    }
+
+    let public_deps = sysroot
+        .public_deps()
+        .map(|(name, idx)| (CrateName::new(name).unwrap(), sysroot_crates[&idx]))
+        .collect::<Vec<_>>();
+
+    let libproc_macro = sysroot.proc_macro().and_then(|it| sysroot_crates.get(&it).copied());
+    (public_deps, libproc_macro)
 }

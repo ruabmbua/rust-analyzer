@@ -291,7 +291,6 @@ pub enum AttrOwner {
 
     Variant(Idx<Variant>),
     Field(Idx<Field>),
-    // FIXME: Store variant and field attrs, and stop reparsing them in `attrs_query`.
 }
 
 macro_rules! from_attrs {
@@ -483,11 +482,16 @@ pub struct Import {
     /// AST ID of the `use` or `extern crate` item this import was derived from. Note that many
     /// `Import`s can map to the same `use` item.
     pub ast_id: FileAstId<ast::Use>,
+    /// Index of this `Import` when the containing `Use` is visited via `ModPath::expand_use_item`.
+    ///
+    /// This can be used to get the `UseTree` this `Import` corresponds to and allows emitting
+    /// precise diagnostics.
+    pub index: usize,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ExternCrate {
-    pub path: ModPath,
+    pub name: Name,
     pub alias: Option<ImportAlias>,
     pub visibility: RawVisibilityId,
     /// Whether this is a `#[macro_use] extern crate ...`.
@@ -501,6 +505,7 @@ pub struct Function {
     pub visibility: RawVisibilityId,
     pub generic_params: GenericParamsId,
     pub has_self_param: bool,
+    pub has_body: bool,
     pub is_unsafe: bool,
     pub params: Box<[TypeRef]>,
     pub is_varargs: bool,
@@ -592,6 +597,7 @@ pub struct TypeAlias {
     pub bounds: Box<[TypeBound]>,
     pub generic_params: GenericParamsId,
     pub type_ref: Option<TypeRef>,
+    pub is_extern: bool,
     pub ast_id: FileAstId<ast::TypeAlias>,
 }
 

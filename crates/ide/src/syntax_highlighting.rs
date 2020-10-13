@@ -4,7 +4,7 @@ mod injection;
 #[cfg(test)]
 mod tests;
 
-use hir::{Name, Semantics, VariantDef};
+use hir::{Local, Name, Semantics, VariantDef};
 use ide_db::{
     defs::{classify_name, classify_name_ref, Definition, NameClass, NameRefClass},
     RootDatabase,
@@ -13,8 +13,8 @@ use rustc_hash::FxHashMap;
 use syntax::{
     ast::{self, HasFormatSpecifier},
     AstNode, AstToken, Direction, NodeOrToken, SyntaxElement,
-    SyntaxKind::*,
-    TextRange, WalkEvent, T,
+    SyntaxKind::{self, *},
+    SyntaxNode, SyntaxToken, TextRange, WalkEvent, T,
 };
 
 use crate::FileId;
@@ -68,7 +68,7 @@ pub(crate) fn highlight(
     // When we leave a node, the we use it to flatten the highlighted ranges.
     let mut stack = HighlightedRangeStack::new();
 
-    let mut current_macro_call: Option<ast::MacroCall> = None;
+    let mut current_macro_call: Option<(ast::MacroCall, Option<MacroMatcherParseState>)> = None;
     let mut format_string: Option<SyntaxElement> = None;
 
     // Walk all nodes, keeping track of whether we are inside a macro or not.
@@ -92,7 +92,6 @@ pub(crate) fn highlight(
         // Track "inside macro" state
         match event.clone().map(|it| it.into_node().and_then(ast::MacroCall::cast)) {
             WalkEvent::Enter(Some(mc)) => {
-                current_macro_call = Some(mc.clone());
                 if let Some(range) = macro_call_range(&mc) {
                     stack.add(HighlightedRange {
                         range,
@@ -100,7 +99,9 @@ pub(crate) fn highlight(
                         binding_hash: None,
                     });
                 }
+                let mut is_macro_rules = None;
                 if let Some(name) = mc.is_macro_rules() {
+                    is_macro_rules = Some(MacroMatcherParseState::new());
                     if let Some((highlight, binding_hash)) = highlight_element(
                         &sema,
                         &mut bindings_shadow_count,
@@ -114,10 +115,11 @@ pub(crate) fn highlight(
                         });
                     }
                 }
+                current_macro_call = Some((mc.clone(), is_macro_rules));
                 continue;
             }
             WalkEvent::Leave(Some(mc)) => {
-                assert!(current_macro_call == Some(mc));
+                assert!(current_macro_call.map(|it| it.0) == Some(mc));
                 current_macro_call = None;
                 format_string = None;
             }
@@ -145,6 +147,20 @@ pub(crate) fn highlight(
             WalkEvent::Enter(it) => it,
             WalkEvent::Leave(_) => continue,
         };
+
+        // check if in matcher part of a macro_rules rule
+        if let Some((_, Some(ref mut state))) = current_macro_call {
+            if let Some(tok) = element.as_token() {
+                if matches!(
+                    update_macro_rules_state(tok, state),
+                    RuleState::Matcher | RuleState::Expander
+                ) {
+                    if skip_metavariables(element.clone()) {
+                        continue;
+                    }
+                }
+            }
+        }
 
         let range = element.text_range();
 
@@ -454,6 +470,32 @@ fn macro_call_range(macro_call: &ast::MacroCall) -> Option<TextRange> {
     Some(TextRange::new(range_start, range_end))
 }
 
+/// Returns true if the parent nodes of `node` all match the `SyntaxKind`s in `kinds` exactly.
+fn parents_match(mut node: NodeOrToken<SyntaxNode, SyntaxToken>, mut kinds: &[SyntaxKind]) -> bool {
+    while let (Some(parent), [kind, rest @ ..]) = (&node.parent(), kinds) {
+        if parent.kind() != *kind {
+            return false;
+        }
+
+        // FIXME: Would be nice to get parent out of the match, but binding by-move and by-value
+        // in the same pattern is unstable: rust-lang/rust#68354.
+        node = node.parent().unwrap().into();
+        kinds = rest;
+    }
+
+    // Only true if we matched all expected kinds
+    kinds.len() == 0
+}
+
+fn is_consumed_lvalue(
+    node: NodeOrToken<SyntaxNode, SyntaxToken>,
+    local: &Local,
+    db: &RootDatabase,
+) -> bool {
+    // When lvalues are passed as arguments and they're not Copy, then mark them as Consuming.
+    parents_match(node, &[PATH_SEGMENT, PATH, PATH_EXPR, ARG_LIST]) && !local.ty(db).is_copy(db)
+}
+
 fn highlight_element(
     sema: &Semantics<RootDatabase>,
     bindings_shadow_count: &mut FxHashMap<Name, u32>,
@@ -521,6 +563,12 @@ fn highlight_element(
                             };
 
                             let mut h = highlight_def(db, def);
+
+                            if let Definition::Local(local) = &def {
+                                if is_consumed_lvalue(name_ref.syntax().clone().into(), local, db) {
+                                    h |= HighlightModifier::Consuming;
+                                }
+                            }
 
                             if let Some(parent) = name_ref.syntax().parent() {
                                 if matches!(parent.kind(), FIELD_EXPR | RECORD_PAT_FIELD) {
@@ -645,21 +693,30 @@ fn highlight_element(
                         .and_then(ast::SelfParam::cast)
                         .and_then(|p| p.mut_token())
                         .is_some();
-                    // closure to enforce lazyness
-                    let self_path = || {
-                        sema.resolve_path(&element.parent()?.parent().and_then(ast::Path::cast)?)
-                    };
+                    let self_path = &element
+                        .parent()
+                        .as_ref()
+                        .and_then(SyntaxNode::parent)
+                        .and_then(ast::Path::cast)
+                        .and_then(|p| sema.resolve_path(&p));
+                    let mut h = HighlightTag::SelfKeyword.into();
                     if self_param_is_mut
-                        || matches!(self_path(),
+                        || matches!(self_path,
                             Some(hir::PathResolution::Local(local))
                                 if local.is_self(db)
                                     && (local.is_mut(db) || local.ty(db).is_mutable_reference())
                         )
                     {
-                        HighlightTag::SelfKeyword | HighlightModifier::Mutable
-                    } else {
-                        HighlightTag::SelfKeyword.into()
+                        h |= HighlightModifier::Mutable
                     }
+
+                    if let Some(hir::PathResolution::Local(local)) = self_path {
+                        if is_consumed_lvalue(element, &local, db) {
+                            h |= HighlightModifier::Consuming;
+                        }
+                    }
+
+                    h
                 }
                 T![ref] => element
                     .parent()
@@ -875,5 +932,101 @@ fn highlight_name_ref_by_syntax(name: ast::NameRef, sema: &Semantics<RootDatabas
             }
         }
         _ => default.into(),
+    }
+}
+
+struct MacroMatcherParseState {
+    /// Opening and corresponding closing bracket of the matcher or expander of the current rule
+    paren_ty: Option<(SyntaxKind, SyntaxKind)>,
+    paren_level: usize,
+    rule_state: RuleState,
+    /// Whether we are inside the outer `{` `}` macro block that holds the rules
+    in_invoc_body: bool,
+}
+
+impl MacroMatcherParseState {
+    fn new() -> Self {
+        MacroMatcherParseState {
+            paren_ty: None,
+            paren_level: 0,
+            in_invoc_body: false,
+            rule_state: RuleState::None,
+        }
+    }
+}
+
+#[derive(Copy, Clone, PartialEq)]
+enum RuleState {
+    Matcher,
+    Expander,
+    Between,
+    None,
+}
+
+impl RuleState {
+    fn transition(&mut self) {
+        *self = match self {
+            RuleState::Matcher => RuleState::Between,
+            RuleState::Expander => RuleState::None,
+            RuleState::Between => RuleState::Expander,
+            RuleState::None => RuleState::Matcher,
+        };
+    }
+}
+
+fn update_macro_rules_state(tok: &SyntaxToken, state: &mut MacroMatcherParseState) -> RuleState {
+    if !state.in_invoc_body {
+        if tok.kind() == T!['{'] {
+            state.in_invoc_body = true;
+        }
+        return state.rule_state;
+    }
+
+    match state.paren_ty {
+        Some((open, close)) => {
+            if tok.kind() == open {
+                state.paren_level += 1;
+            } else if tok.kind() == close {
+                state.paren_level -= 1;
+                if state.paren_level == 0 {
+                    let res = state.rule_state;
+                    state.rule_state.transition();
+                    state.paren_ty = None;
+                    return res;
+                }
+            }
+        }
+        None => {
+            match tok.kind() {
+                T!['('] => {
+                    state.paren_ty = Some((T!['('], T![')']));
+                }
+                T!['{'] => {
+                    state.paren_ty = Some((T!['{'], T!['}']));
+                }
+                T!['['] => {
+                    state.paren_ty = Some((T!['['], T![']']));
+                }
+                _ => (),
+            }
+            if state.paren_ty.is_some() {
+                state.paren_level = 1;
+                state.rule_state.transition();
+            }
+        }
+    }
+    state.rule_state
+}
+
+fn skip_metavariables(element: SyntaxElement) -> bool {
+    let tok = match element.as_token() {
+        Some(tok) => tok,
+        None => return false,
+    };
+    let is_fragment = || tok.prev_token().map(|tok| tok.kind()) == Some(T![$]);
+    match tok.kind() {
+        IDENT if is_fragment() => true,
+        kind if kind.is_keyword() && is_fragment() => true,
+        _ => false,
     }
 }

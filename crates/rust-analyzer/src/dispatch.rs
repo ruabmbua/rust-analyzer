@@ -1,5 +1,5 @@
 //! A visitor for downcasting arbitrary request (JSON) into a specific type.
-use std::panic;
+use std::{fmt, panic};
 
 use serde::{de::DeserializeOwned, Serialize};
 
@@ -23,7 +23,7 @@ impl<'a> RequestDispatcher<'a> {
     ) -> Result<&mut Self>
     where
         R: lsp_types::request::Request + 'static,
-        R::Params: DeserializeOwned + panic::UnwindSafe + 'static,
+        R::Params: DeserializeOwned + panic::UnwindSafe + fmt::Debug + 'static,
         R::Result: Serialize + 'static,
     {
         let (id, params) = match self.parse::<R>() {
@@ -34,6 +34,7 @@ impl<'a> RequestDispatcher<'a> {
         };
         let world = panic::AssertUnwindSafe(&mut *self.global_state);
         let response = panic::catch_unwind(move || {
+            stdx::panic_context::enter(format!("request: {} {:#?}", R::METHOD, params));
             let result = f(world.0, params);
             result_to_response::<R>(id, result)
         })
@@ -49,7 +50,7 @@ impl<'a> RequestDispatcher<'a> {
     ) -> Result<&mut Self>
     where
         R: lsp_types::request::Request + 'static,
-        R::Params: DeserializeOwned + Send + 'static,
+        R::Params: DeserializeOwned + Send + fmt::Debug + 'static,
         R::Result: Serialize + 'static,
     {
         let (id, params) = match self.parse::<R>() {
@@ -61,7 +62,10 @@ impl<'a> RequestDispatcher<'a> {
 
         self.global_state.task_pool.handle.spawn({
             let world = self.global_state.snapshot();
+
             move || {
+                let _ctx =
+                    stdx::panic_context::enter(format!("request: {} {:#?}", R::METHOD, params));
                 let result = f(world, params);
                 Task::Response(result_to_response::<R>(id, result))
             }
@@ -156,6 +160,7 @@ impl<'a> NotificationDispatcher<'a> {
                 return Ok(self);
             }
         };
+        stdx::panic_context::enter(format!("notification: {}", N::METHOD));
         f(self.global_state, params)?;
         Ok(self)
     }

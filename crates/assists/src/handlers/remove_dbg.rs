@@ -1,6 +1,6 @@
 use syntax::{
     ast::{self, AstNode},
-    TextRange, TextSize, T,
+    SyntaxElement, SyntaxKind, TextRange, TextSize, T,
 };
 
 use crate::{AssistContext, AssistId, AssistKind, Assists};
@@ -22,62 +22,111 @@ use crate::{AssistContext, AssistId, AssistKind, Assists};
 // ```
 pub(crate) fn remove_dbg(acc: &mut Assists, ctx: &AssistContext) -> Option<()> {
     let macro_call = ctx.find_node_at_offset::<ast::MacroCall>()?;
+    let new_contents = adjusted_macro_contents(&macro_call)?;
 
-    if !is_valid_macrocall(&macro_call, "dbg")? {
-        return None;
-    }
+    let macro_text_range = macro_call.syntax().text_range();
+    let macro_end = if macro_call.semicolon_token().is_some() {
+        macro_text_range.end() - TextSize::of(';')
+    } else {
+        macro_text_range.end()
+    };
+
+    acc.add(
+        AssistId("remove_dbg", AssistKind::Refactor),
+        "Remove dbg!()",
+        macro_text_range,
+        |builder| {
+            builder.replace(TextRange::new(macro_text_range.start(), macro_end), new_contents);
+        },
+    )
+}
+
+fn adjusted_macro_contents(macro_call: &ast::MacroCall) -> Option<String> {
+    let contents = get_valid_macrocall_contents(&macro_call, "dbg")?;
+    let macro_text_with_brackets = macro_call.token_tree()?.syntax().text();
+    let macro_text_in_brackets = macro_text_with_brackets.slice(TextRange::new(
+        TextSize::of('('),
+        macro_text_with_brackets.len() - TextSize::of(')'),
+    ));
 
     let is_leaf = macro_call.syntax().next_sibling().is_none();
-
-    let macro_end = if macro_call.semicolon_token().is_some() {
-        macro_call.syntax().text_range().end() - TextSize::of(';')
+    Some(if !is_leaf && needs_parentheses_around_macro_contents(contents) {
+        format!("({})", macro_text_in_brackets)
     } else {
-        macro_call.syntax().text_range().end()
-    };
-
-    // macro_range determines what will be deleted and replaced with macro_content
-    let macro_range = TextRange::new(macro_call.syntax().text_range().start(), macro_end);
-    let paste_instead_of_dbg = {
-        let text = macro_call.token_tree()?.syntax().text();
-
-        // leafiness determines if we should include the parenthesis or not
-        let slice_index: TextRange = if is_leaf {
-            // leaf means - we can extract the contents of the dbg! in text
-            TextRange::new(TextSize::of('('), text.len() - TextSize::of(')'))
-        } else {
-            // not leaf - means we should keep the parens
-            TextRange::up_to(text.len())
-        };
-        text.slice(slice_index).to_string()
-    };
-
-    let target = macro_call.syntax().text_range();
-    acc.add(AssistId("remove_dbg", AssistKind::Refactor), "Remove dbg!()", target, |builder| {
-        builder.replace(macro_range, paste_instead_of_dbg);
+        macro_text_in_brackets.to_string()
     })
 }
 
 /// Verifies that the given macro_call actually matches the given name
-/// and contains proper ending tokens
-fn is_valid_macrocall(macro_call: &ast::MacroCall, macro_name: &str) -> Option<bool> {
+/// and contains proper ending tokens, then returns the contents between the ending tokens
+fn get_valid_macrocall_contents(
+    macro_call: &ast::MacroCall,
+    macro_name: &str,
+) -> Option<Vec<SyntaxElement>> {
     let path = macro_call.path()?;
     let name_ref = path.segment()?.name_ref()?;
 
     // Make sure it is actually a dbg-macro call, dbg followed by !
     let excl = path.syntax().next_sibling_or_token()?;
-
     if name_ref.text() != macro_name || excl.kind() != T![!] {
         return None;
     }
 
-    let node = macro_call.token_tree()?.syntax().clone();
-    let first_child = node.first_child_or_token()?;
-    let last_child = node.last_child_or_token()?;
+    let mut children_with_tokens = macro_call.token_tree()?.syntax().children_with_tokens();
+    let first_child = children_with_tokens.next()?;
+    let mut contents_between_brackets = children_with_tokens.collect::<Vec<_>>();
+    let last_child = contents_between_brackets.pop()?;
 
-    match (first_child.kind(), last_child.kind()) {
-        (T!['('], T![')']) | (T!['['], T![']']) | (T!['{'], T!['}']) => Some(true),
-        _ => Some(false),
+    if contents_between_brackets.is_empty() {
+        None
+    } else {
+        match (first_child.kind(), last_child.kind()) {
+            (T!['('], T![')']) | (T!['['], T![']']) | (T!['{'], T!['}']) => {
+                Some(contents_between_brackets)
+            }
+            _ => None,
+        }
     }
+}
+
+fn needs_parentheses_around_macro_contents(macro_contents: Vec<SyntaxElement>) -> bool {
+    if macro_contents.len() < 2 {
+        return false;
+    }
+    let mut unpaired_brackets_in_contents = Vec::new();
+    for element in macro_contents {
+        match element.kind() {
+            T!['('] | T!['['] | T!['{'] => unpaired_brackets_in_contents.push(element),
+            T![')'] => {
+                if !matches!(unpaired_brackets_in_contents.pop(), Some(correct_bracket) if correct_bracket.kind() == T!['('])
+                {
+                    return true;
+                }
+            }
+            T![']'] => {
+                if !matches!(unpaired_brackets_in_contents.pop(), Some(correct_bracket) if correct_bracket.kind() == T!['['])
+                {
+                    return true;
+                }
+            }
+            T!['}'] => {
+                if !matches!(unpaired_brackets_in_contents.pop(), Some(correct_bracket) if correct_bracket.kind() == T!['{'])
+                {
+                    return true;
+                }
+            }
+            symbol_kind => {
+                let symbol_not_in_bracket = unpaired_brackets_in_contents.is_empty();
+                if symbol_not_in_bracket
+                    && symbol_kind != SyntaxKind::COLON
+                    && symbol_kind.is_punct()
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    !unpaired_brackets_in_contents.is_empty()
 }
 
 #[cfg(test)]
@@ -113,6 +162,8 @@ fn foo(n: usize) {
 }
 ",
         );
+
+        check_assist(remove_dbg, "<|>dbg!(Foo::foo_test()).bar()", "Foo::foo_test().bar()");
     }
 
     #[test]
@@ -157,12 +208,38 @@ fn foo(n: usize) {
     }
 
     #[test]
+    fn remove_dbg_from_non_leaf_simple_expression() {
+        check_assist(
+            remove_dbg,
+            "
+fn main() {
+    let mut a = 1;
+    while dbg!<|>(a) < 10000 {
+        a += 1;
+    }
+}
+",
+            "
+fn main() {
+    let mut a = 1;
+    while a < 10000 {
+        a += 1;
+    }
+}
+",
+        );
+    }
+
+    #[test]
     fn test_remove_dbg_keep_expression() {
         check_assist(
             remove_dbg,
             r#"let res = <|>dbg!(a + b).foo();"#,
             r#"let res = (a + b).foo();"#,
         );
+
+        check_assist(remove_dbg, r#"let res = <|>dbg!(2 + 2) * 5"#, r#"let res = (2 + 2) * 5"#);
+        check_assist(remove_dbg, r#"let res = <|>dbg![2 + 2] * 5"#, r#"let res = (2 + 2) * 5"#);
     }
 
     #[test]

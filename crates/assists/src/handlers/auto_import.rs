@@ -6,6 +6,7 @@ use hir::{
     Type,
 };
 use ide_db::{imports_locator, RootDatabase};
+use insert_use::ImportScope;
 use rustc_hash::FxHashSet;
 use syntax::{
     ast::{self, AstNode},
@@ -13,7 +14,8 @@ use syntax::{
 };
 
 use crate::{
-    utils::insert_use_statement, AssistContext, AssistId, AssistKind, Assists, GroupLabel,
+    utils::insert_use, utils::mod_path_to_ast, AssistContext, AssistId, AssistKind, Assists,
+    GroupLabel,
 };
 
 // Assist: auto_import
@@ -44,6 +46,9 @@ pub(crate) fn auto_import(acc: &mut Assists, ctx: &AssistContext) -> Option<()> 
 
     let range = ctx.sema.original_range(&auto_import_assets.syntax_under_caret).range;
     let group = auto_import_assets.get_import_group_message();
+    let scope =
+        ImportScope::find_insert_use_container(&auto_import_assets.syntax_under_caret, ctx)?;
+    let syntax = scope.as_syntax_node();
     for import in proposed_imports {
         acc.add_group(
             &group,
@@ -51,12 +56,9 @@ pub(crate) fn auto_import(acc: &mut Assists, ctx: &AssistContext) -> Option<()> 
             format!("Import `{}`", &import),
             range,
             |builder| {
-                insert_use_statement(
-                    &auto_import_assets.syntax_under_caret,
-                    &import.to_string(),
-                    ctx,
-                    builder.text_edit_builder(),
-                );
+                let new_syntax =
+                    insert_use(&scope, mod_path_to_ast(&import), ctx.config.insert_use.merge);
+                builder.replace(syntax.text_range(), new_syntax.to_string())
             },
         );
     }
@@ -192,12 +194,16 @@ impl AutoImportAssets {
                 _ => Some(candidate),
             })
             .filter_map(|candidate| match candidate {
-                Either::Left(module_def) => {
-                    self.module_with_name_to_import.find_use_path(db, module_def)
-                }
-                Either::Right(macro_def) => {
-                    self.module_with_name_to_import.find_use_path(db, macro_def)
-                }
+                Either::Left(module_def) => self.module_with_name_to_import.find_use_path_prefixed(
+                    db,
+                    module_def,
+                    ctx.config.insert_use.prefix_kind,
+                ),
+                Either::Right(macro_def) => self.module_with_name_to_import.find_use_path_prefixed(
+                    db,
+                    macro_def,
+                    ctx.config.insert_use.prefix_kind,
+                ),
             })
             .filter(|use_path| !use_path.segments.is_empty())
             .take(20)
@@ -288,6 +294,35 @@ mod tests {
     use crate::tests::{check_assist, check_assist_not_applicable, check_assist_target};
 
     #[test]
+    fn applicable_when_found_an_import_partial() {
+        check_assist(
+            auto_import,
+            r"
+            mod std {
+                pub mod fmt {
+                    pub struct Formatter;
+                }
+            }
+
+            use std::fmt;
+
+            <|>Formatter
+            ",
+            r"
+            mod std {
+                pub mod fmt {
+                    pub struct Formatter;
+                }
+            }
+
+            use std::fmt::{self, Formatter};
+
+            Formatter
+            ",
+        );
+    }
+
+    #[test]
     fn applicable_when_found_an_import() {
         check_assist(
             auto_import,
@@ -358,7 +393,7 @@ mod tests {
             }
             ",
             r"
-            use PubMod::{PubStruct2, PubStruct1};
+            use PubMod::{PubStruct1, PubStruct2};
 
             struct Test {
                 test: PubStruct2<u8>,

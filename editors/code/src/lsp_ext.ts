@@ -1,11 +1,14 @@
 /**
- * This file mirrors `crates/rust-analyzer/src/req.rs` declarations.
+ * This file mirrors `crates/rust-analyzer/src/lsp_ext.rs` declarations.
  */
 
 import * as lc from "vscode-languageclient";
 
-export const analyzerStatus = new lc.RequestType<null, string, void>("rust-analyzer/analyzerStatus");
-export const memoryUsage = new lc.RequestType<null, string, void>("rust-analyzer/memoryUsage");
+export interface AnalyzerStatusParams {
+    textDocument?: lc.TextDocumentIdentifier;
+}
+export const analyzerStatus = new lc.RequestType<AnalyzerStatusParams, string, void>("rust-analyzer/analyzerStatus");
+export const memoryUsage = new lc.RequestType0<string, void>("rust-analyzer/memoryUsage");
 
 export type Status = "loading" | "ready" | "invalid" | "needsReload";
 export interface StatusParams {
@@ -13,7 +16,7 @@ export interface StatusParams {
 }
 export const status = new lc.NotificationType<StatusParams>("rust-analyzer/status");
 
-export const reloadWorkspace = new lc.RequestType<null, null, void>("rust-analyzer/reloadWorkspace");
+export const reloadWorkspace = new lc.RequestType0<null, void>("rust-analyzer/reloadWorkspace");
 
 export interface SyntaxTreeParams {
     textDocument: lc.TextDocumentIdentifier;
@@ -66,8 +69,10 @@ export interface Runnable {
     args: {
         workspaceRoot?: string;
         cargoArgs: string[];
+        cargoExtraArgs: string[];
         executableArgs: string[];
         expectTest?: boolean;
+        overrideCargo?: string;
     };
 }
 export const runnables = new lc.RequestType<RunnablesParams, Runnable[], void>("experimental/runnables");
@@ -113,3 +118,5 @@ export interface CommandLinkGroup {
     title?: string;
     commands: CommandLink[];
 }
+
+export const openDocs = new lc.RequestType<lc.TextDocumentPositionParams, string | void, void>('experimental/externalDocs');

@@ -12,7 +12,7 @@ use cfg::CfgOptions;
 use rustc_hash::{FxHashMap, FxHashSet};
 use syntax::SmolStr;
 use tt::TokenExpander;
-use vfs::file_set::FileSet;
+use vfs::{file_set::FileSet, VfsPath};
 
 pub use vfs::FileId;
 
@@ -42,6 +42,12 @@ impl SourceRoot {
     }
     pub fn new_library(file_set: FileSet) -> SourceRoot {
         SourceRoot { is_library: true, file_set }
+    }
+    pub fn path_for_file(&self, file: &FileId) -> Option<&VfsPath> {
+        self.file_set.path_for_file(file)
+    }
+    pub fn file_for_path(&self, path: &VfsPath) -> Option<&FileId> {
+        self.file_set.file_for_path(path)
     }
     pub fn iter(&self) -> impl Iterator<Item = FileId> + '_ {
         self.file_set.iter()
@@ -121,10 +127,11 @@ impl PartialEq for ProcMacro {
 pub struct CrateData {
     pub root_file_id: FileId,
     pub edition: Edition,
-    /// The name to display to the end user.
-    /// This actual crate name can be different in a particular dependent crate
-    /// or may even be missing for some cases, such as a dummy crate for the code snippet.
-    pub display_name: Option<String>,
+    /// A name used in the package's project declaration: for Cargo projects, it's [package].name,
+    /// can be different for other project types or even absent (a dummy crate for the code snippet, for example).
+    /// NOTE: The crate can be referenced as a dependency under a different name,
+    /// this one should be used when working with crate hierarchies.
+    pub declaration_name: Option<CrateName>,
     pub cfg_options: CfgOptions,
     pub env: Env,
     pub dependencies: Vec<Dependency>,
@@ -153,7 +160,7 @@ impl CrateGraph {
         &mut self,
         file_id: FileId,
         edition: Edition,
-        display_name: Option<String>,
+        declaration_name: Option<CrateName>,
         cfg_options: CfgOptions,
         env: Env,
         proc_macro: Vec<(SmolStr, Arc<dyn tt::TokenExpander>)>,
@@ -164,7 +171,7 @@ impl CrateGraph {
         let data = CrateData {
             root_file_id: file_id,
             edition,
-            display_name,
+            declaration_name,
             cfg_options,
             env,
             proc_macro,
@@ -212,6 +219,34 @@ impl CrateGraph {
 
         deps.remove(&of);
         deps.into_iter()
+    }
+
+    /// Returns all crates in the graph, sorted in topological order (ie. dependencies of a crate
+    /// come before the crate itself).
+    pub fn crates_in_topological_order(&self) -> Vec<CrateId> {
+        let mut res = Vec::new();
+        let mut visited = FxHashSet::default();
+
+        for krate in self.arena.keys().copied() {
+            go(self, &mut visited, &mut res, krate);
+        }
+
+        return res;
+
+        fn go(
+            graph: &CrateGraph,
+            visited: &mut FxHashSet<CrateId>,
+            res: &mut Vec<CrateId>,
+            source: CrateId,
+        ) {
+            if !visited.insert(source) {
+                return;
+            }
+            for dep in graph[source].dependencies.iter() {
+                go(graph, visited, res, dep.crate_id)
+            }
+            res.push(source)
+        }
     }
 
     // FIXME: this only finds one crate with the given root; we could have multiple

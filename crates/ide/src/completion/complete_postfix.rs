@@ -1,11 +1,15 @@
 //! FIXME: write short doc here
+
+mod format_like;
+
 use assists::utils::TryEnum;
 use syntax::{
-    ast::{self, AstNode},
+    ast::{self, AstNode, AstToken},
     TextRange, TextSize,
 };
 use text_edit::TextEdit;
 
+use self::format_like::add_format_like_completions;
 use crate::{
     completion::{
         completion_config::SnippetCap,
@@ -175,6 +179,9 @@ pub(super) fn complete_postfix(acc: &mut Completions, ctx: &CompletionContext) {
     )
     .add_to(acc);
 
+    postfix_snippet(ctx, cap, &dot_receiver, "ok", "Ok(expr)", &format!("Ok({})", receiver_text))
+        .add_to(acc);
+
     postfix_snippet(
         ctx,
         cap,
@@ -189,11 +196,27 @@ pub(super) fn complete_postfix(acc: &mut Completions, ctx: &CompletionContext) {
         ctx,
         cap,
         &dot_receiver,
+        "dbgr",
+        "dbg!(&expr)",
+        &format!("dbg!(&{})", receiver_text),
+    )
+    .add_to(acc);
+
+    postfix_snippet(
+        ctx,
+        cap,
+        &dot_receiver,
         "call",
         "function(expr)",
         &format!("${{1}}({})", receiver_text),
     )
     .add_to(acc);
+
+    if let ast::Expr::Literal(literal) = dot_receiver.clone() {
+        if let Some(literal_text) = ast::String::cast(literal.token()) {
+            add_format_like_completions(acc, ctx, &dot_receiver, cap, &literal_text);
+        }
+    }
 }
 
 fn get_receiver_text(receiver: &ast::Expr, receiver_is_ambiguous_float_literal: bool) -> String {
@@ -263,9 +286,11 @@ fn main() {
                 sn box   Box::new(expr)
                 sn call  function(expr)
                 sn dbg   dbg!(expr)
+                sn dbgr  dbg!(&expr)
                 sn if    if expr {}
                 sn match match expr {}
                 sn not   !expr
+                sn ok    Ok(expr)
                 sn ref   &expr
                 sn refm  &mut expr
                 sn while while expr {}
@@ -286,7 +311,9 @@ fn main() {
                 sn box   Box::new(expr)
                 sn call  function(expr)
                 sn dbg   dbg!(expr)
+                sn dbgr  dbg!(&expr)
                 sn match match expr {}
+                sn ok    Ok(expr)
                 sn ref   &expr
                 sn refm  &mut expr
             "#]],
@@ -374,5 +401,54 @@ fn main() {
     fn postfix_completion_for_references() {
         check_edit("dbg", r#"fn main() { &&42.<|> }"#, r#"fn main() { dbg!(&&42) }"#);
         check_edit("refm", r#"fn main() { &&42.<|> }"#, r#"fn main() { &&&mut 42 }"#);
+    }
+
+    #[test]
+    fn postfix_completion_for_format_like_strings() {
+        check_edit(
+            "fmt",
+            r#"fn main() { "{some_var:?}".<|> }"#,
+            r#"fn main() { format!("{:?}", some_var) }"#,
+        );
+        check_edit(
+            "panic",
+            r#"fn main() { "Panic with {a}".<|> }"#,
+            r#"fn main() { panic!("Panic with {}", a) }"#,
+        );
+        check_edit(
+            "println",
+            r#"fn main() { "{ 2+2 } { SomeStruct { val: 1, other: 32 } :?}".<|> }"#,
+            r#"fn main() { println!("{} {:?}", 2+2, SomeStruct { val: 1, other: 32 }) }"#,
+        );
+        check_edit(
+            "loge",
+            r#"fn main() { "{2+2}".<|> }"#,
+            r#"fn main() { log::error!("{}", 2+2) }"#,
+        );
+        check_edit(
+            "logt",
+            r#"fn main() { "{2+2}".<|> }"#,
+            r#"fn main() { log::trace!("{}", 2+2) }"#,
+        );
+        check_edit(
+            "logd",
+            r#"fn main() { "{2+2}".<|> }"#,
+            r#"fn main() { log::debug!("{}", 2+2) }"#,
+        );
+        check_edit(
+            "logi",
+            r#"fn main() { "{2+2}".<|> }"#,
+            r#"fn main() { log::info!("{}", 2+2) }"#,
+        );
+        check_edit(
+            "logw",
+            r#"fn main() { "{2+2}".<|> }"#,
+            r#"fn main() { log::warn!("{}", 2+2) }"#,
+        );
+        check_edit(
+            "loge",
+            r#"fn main() { "{2+2}".<|> }"#,
+            r#"fn main() { log::error!("{}", 2+2) }"#,
+        );
     }
 }

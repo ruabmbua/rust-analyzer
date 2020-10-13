@@ -19,6 +19,7 @@ mod complete_unqualified_path;
 mod complete_postfix;
 mod complete_macro_in_item_position;
 mod complete_trait_impl;
+mod complete_mod;
 
 use ide_db::RootDatabase;
 
@@ -92,7 +93,7 @@ pub use crate::completion::{
 /// already present, it should give all possible variants for the identifier at
 /// the caret. In other words, for
 ///
-/// ```no-run
+/// ```no_run
 /// fn f() {
 ///     let foo = 92;
 ///     let _ = bar<|>
@@ -124,6 +125,7 @@ pub(crate) fn completions(
     complete_postfix::complete_postfix(&mut acc, &ctx);
     complete_macro_in_item_position::complete_macro_in_item_position(&mut acc, &ctx);
     complete_trait_impl::complete_trait_impl(&mut acc, &ctx);
+    complete_mod::complete_mod(&mut acc, &ctx);
 
     Some(acc)
 }
@@ -131,7 +133,7 @@ pub(crate) fn completions(
 #[cfg(test)]
 mod tests {
     use crate::completion::completion_config::CompletionConfig;
-    use crate::mock_analysis::analysis_and_position;
+    use crate::fixture;
 
     struct DetailAndDocumentation<'a> {
         detail: &'a str,
@@ -139,7 +141,7 @@ mod tests {
     }
 
     fn check_detail_and_documentation(ra_fixture: &str, expected: DetailAndDocumentation) {
-        let (analysis, position) = analysis_and_position(ra_fixture);
+        let (analysis, position) = fixture::position(ra_fixture);
         let config = CompletionConfig::default();
         let completions = analysis.completions(&config, position).unwrap().unwrap();
         for item in completions {

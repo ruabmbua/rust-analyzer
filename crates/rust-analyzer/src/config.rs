@@ -10,8 +10,12 @@
 use std::{ffi::OsString, path::PathBuf};
 
 use flycheck::FlycheckConfig;
-use ide::{AssistConfig, CompletionConfig, DiagnosticsConfig, HoverConfig, InlayHintsConfig};
-use lsp_types::ClientCapabilities;
+use hir::PrefixKind;
+use ide::{
+    AssistConfig, CompletionConfig, DiagnosticsConfig, HoverConfig, InlayHintsConfig,
+    MergeBehaviour,
+};
+use lsp_types::{ClientCapabilities, MarkupKind};
 use project_model::{CargoConfig, ProjectJson, ProjectJsonData, ProjectManifest};
 use rustc_hash::FxHashSet;
 use serde::Deserialize;
@@ -35,6 +39,7 @@ pub struct Config {
     pub cargo: CargoConfig,
     pub rustfmt: RustfmtConfig,
     pub flycheck: Option<FlycheckConfig>,
+    pub runnables: RunnablesConfig,
 
     pub inlay_hints: InlayHintsConfig,
     pub completion: CompletionConfig,
@@ -71,19 +76,18 @@ pub struct LensConfig {
     pub run: bool,
     pub debug: bool,
     pub implementations: bool,
+    pub method_refs: bool,
 }
 
 impl Default for LensConfig {
     fn default() -> Self {
-        Self { run: true, debug: true, implementations: true }
+        Self { run: true, debug: true, implementations: true, method_refs: false }
     }
 }
 
 impl LensConfig {
-    pub const NO_LENS: LensConfig = Self { run: false, debug: false, implementations: false };
-
     pub fn any(&self) -> bool {
-        self.implementations || self.runnable()
+        self.implementations || self.runnable() || self.references()
     }
 
     pub fn none(&self) -> bool {
@@ -92,6 +96,10 @@ impl LensConfig {
 
     pub fn runnable(&self) -> bool {
         self.run || self.debug
+    }
+
+    pub fn references(&self) -> bool {
+        self.method_refs
     }
 }
 
@@ -116,6 +124,15 @@ pub struct NotificationsConfig {
 pub enum RustfmtConfig {
     Rustfmt { extra_args: Vec<String> },
     CustomCommand { command: String, args: Vec<String> },
+}
+
+/// Configuration for runnable items, such as `main` function or tests.
+#[derive(Debug, Clone, Default)]
+pub struct RunnablesConfig {
+    /// Custom command to be executed instead of `cargo` for runnables.
+    pub override_cargo: Option<String>,
+    /// Additional arguments for the `cargo`, e.g. `--release`.
+    pub cargo_extra_args: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -158,6 +175,7 @@ impl Config {
                 extra_args: Vec::new(),
                 features: Vec::new(),
             }),
+            runnables: RunnablesConfig::default(),
 
             inlay_hints: InlayHintsConfig {
                 type_hints: true,
@@ -214,6 +232,10 @@ impl Config {
             load_out_dirs_from_check: data.cargo_loadOutDirsFromCheck,
             target: data.cargo_target.clone(),
         };
+        self.runnables = RunnablesConfig {
+            override_cargo: data.runnables_overrideCargo,
+            cargo_extra_args: data.runnables_cargoExtraArgs,
+        };
 
         self.proc_macro_srv = if data.procMacro_enable {
             std::env::current_exe().ok().map(|path| (path, vec!["proc-macro".into()]))
@@ -263,12 +285,24 @@ impl Config {
         self.completion.add_call_parenthesis = data.completion_addCallParenthesis;
         self.completion.add_call_argument_snippets = data.completion_addCallArgumentSnippets;
 
+        self.assist.insert_use.merge = match data.assist_importMergeBehaviour {
+            MergeBehaviourDef::None => None,
+            MergeBehaviourDef::Full => Some(MergeBehaviour::Full),
+            MergeBehaviourDef::Last => Some(MergeBehaviour::Last),
+        };
+        self.assist.insert_use.prefix_kind = match data.assist_importPrefix {
+            ImportPrefixDef::Plain => PrefixKind::Plain,
+            ImportPrefixDef::ByCrate => PrefixKind::ByCrate,
+            ImportPrefixDef::BySelf => PrefixKind::BySelf,
+        };
+
         self.call_info_full = data.callInfo_full;
 
         self.lens = LensConfig {
             run: data.lens_enable && data.lens_run,
             debug: data.lens_enable && data.lens_debug,
             implementations: data.lens_enable && data.lens_implementations,
+            method_refs: data.lens_enable && data.lens_methodReferences,
         };
 
         if !data.linkedProjects.is_empty() {
@@ -279,7 +313,10 @@ impl Config {
                         let path = self.root_path.join(it);
                         match ProjectManifest::from_manifest_file(path) {
                             Ok(it) => it.into(),
-                            Err(_) => continue,
+                            Err(e) => {
+                                log::error!("failed to load linked project: {}", e);
+                                continue;
+                            }
                         }
                     }
                     ManifestOrProjectJson::ProjectJson(it) => {
@@ -295,6 +332,8 @@ impl Config {
             run: data.hoverActions_enable && data.hoverActions_run,
             debug: data.hoverActions_enable && data.hoverActions_debug,
             goto_type_def: data.hoverActions_enable && data.hoverActions_gotoTypeDef,
+            links_in_hover: data.hoverActions_linksInHover,
+            markdown: true,
         };
 
         log::info!("Config::update() = {:#?}", self);
@@ -302,6 +341,9 @@ impl Config {
 
     pub fn update_caps(&mut self, caps: &ClientCapabilities) {
         if let Some(doc_caps) = caps.text_document.as_ref() {
+            if let Some(value) = doc_caps.hover.as_ref().and_then(|it| it.content_format.as_ref()) {
+                self.hover.markdown = value.contains(&MarkupKind::Markdown)
+            }
             if let Some(value) = doc_caps.definition.as_ref().and_then(|it| it.link_support) {
                 self.client_caps.location_link = value;
             }
@@ -370,6 +412,22 @@ enum ManifestOrProjectJson {
     ProjectJson(ProjectJsonData),
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum MergeBehaviourDef {
+    None,
+    Full,
+    Last,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ImportPrefixDef {
+    Plain,
+    BySelf,
+    ByCrate,
+}
+
 macro_rules! config_data {
     (struct $name:ident { $($field:ident: $ty:ty = $default:expr,)*}) => {
         #[allow(non_snake_case)]
@@ -393,6 +451,9 @@ macro_rules! config_data {
 
 config_data! {
     struct ConfigData {
+        assist_importMergeBehaviour: MergeBehaviourDef = MergeBehaviourDef::None,
+        assist_importPrefix: ImportPrefixDef           = ImportPrefixDef::Plain,
+
         callInfo_full: bool = true,
 
         cargo_autoreload: bool           = true,
@@ -402,7 +463,7 @@ config_data! {
         cargo_noDefaultFeatures: bool    = false,
         cargo_target: Option<String>     = None,
 
-        checkOnSave_enable: bool                         = false,
+        checkOnSave_enable: bool                         = true,
         checkOnSave_allFeatures: Option<bool>            = None,
         checkOnSave_allTargets: bool                     = true,
         checkOnSave_command: String                      = "check".into(),
@@ -429,21 +490,26 @@ config_data! {
         hoverActions_gotoTypeDef: bool     = true,
         hoverActions_implementations: bool = true,
         hoverActions_run: bool             = true,
+        hoverActions_linksInHover: bool    = true,
 
         inlayHints_chainingHints: bool      = true,
         inlayHints_maxLength: Option<usize> = None,
         inlayHints_parameterHints: bool     = true,
         inlayHints_typeHints: bool          = true,
 
-        lens_debug: bool           = true,
-        lens_enable: bool          = true,
-        lens_implementations: bool = true,
-        lens_run: bool             = true,
+        lens_debug: bool            = true,
+        lens_enable: bool           = true,
+        lens_implementations: bool  = true,
+        lens_run: bool              = true,
+        lens_methodReferences: bool = false,
 
         linkedProjects: Vec<ManifestOrProjectJson> = Vec::new(),
         lruCapacity: Option<usize>                 = None,
         notifications_cargoTomlNotFound: bool      = true,
         procMacro_enable: bool                     = false,
+
+        runnables_overrideCargo: Option<String> = None,
+        runnables_cargoExtraArgs: Vec<String>   = Vec::new(),
 
         rustfmt_extraArgs: Vec<String>               = Vec::new(),
         rustfmt_overrideCommand: Option<Vec<String>> = None,

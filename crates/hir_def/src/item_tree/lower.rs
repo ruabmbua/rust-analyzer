@@ -330,12 +330,15 @@ impl Ctx {
             ret_type
         };
 
+        let has_body = func.body().is_some();
+
         let ast_id = self.source_ast_id_map.ast_id(func);
         let mut res = Function {
             name,
             visibility,
             generic_params: GenericParamsId::EMPTY,
             has_self_param,
+            has_body,
             is_unsafe: func.unsafe_token().is_some(),
             params: params.into_boxed_slice(),
             is_varargs,
@@ -364,6 +367,7 @@ impl Ctx {
             generic_params,
             type_ref,
             ast_id,
+            is_extern: false,
         };
         Some(id(self.data().type_aliases.alloc(res)))
     }
@@ -482,7 +486,7 @@ impl Ctx {
         ModPath::expand_use_item(
             InFile::new(self.file, use_item.clone()),
             &self.hygiene,
-            |path, _tree, is_glob, alias| {
+            |path, _use_tree, is_glob, alias| {
                 imports.push(id(tree.imports.alloc(Import {
                     path,
                     alias,
@@ -490,6 +494,7 @@ impl Ctx {
                     is_glob,
                     is_prelude,
                     ast_id,
+                    index: imports.len(),
                 })));
             },
         );
@@ -501,7 +506,7 @@ impl Ctx {
         &mut self,
         extern_crate: &ast::ExternCrate,
     ) -> Option<FileItemTreeId<ExternCrate>> {
-        let path = ModPath::from_name_ref(&extern_crate.name_ref()?);
+        let name = extern_crate.name_ref()?.as_name();
         let alias = extern_crate.rename().map(|a| {
             a.name().map(|it| it.as_name()).map_or(ImportAlias::Underscore, ImportAlias::Alias)
         });
@@ -510,7 +515,7 @@ impl Ctx {
         // FIXME: cfg_attr
         let is_macro_use = extern_crate.has_atom_attr("macro_use");
 
-        let res = ExternCrate { path, alias, visibility, is_macro_use, ast_id };
+        let res = ExternCrate { name, alias, visibility, is_macro_use, ast_id };
         Some(id(self.data().extern_crates.alloc(res)))
     }
 
@@ -556,6 +561,11 @@ impl Ctx {
                         ast::ExternItem::Static(ast) => {
                             let statik = self.lower_static(&ast)?;
                             statik.into()
+                        }
+                        ast::ExternItem::TypeAlias(ty) => {
+                            let foreign_ty = self.lower_type_alias(&ty)?;
+                            self.data().type_aliases[foreign_ty.index].is_extern = true;
+                            foreign_ty.into()
                         }
                         ast::ExternItem::MacroCall(_) => return None,
                     };

@@ -4,6 +4,7 @@ use hir_expand::name::{known, AsName, Name};
 use rustc_hash::FxHashSet;
 use test_utils::mark;
 
+use crate::nameres::CrateDefMap;
 use crate::{
     db::DefDatabase,
     item_scope::ItemInNs,
@@ -18,7 +19,17 @@ use crate::{
 /// *from where* you're referring to the item, hence the `from` parameter.
 pub fn find_path(db: &dyn DefDatabase, item: ItemInNs, from: ModuleId) -> Option<ModPath> {
     let _p = profile::span("find_path");
-    find_path_inner(db, item, from, MAX_PATH_LEN)
+    find_path_inner(db, item, from, MAX_PATH_LEN, None)
+}
+
+pub fn find_path_prefixed(
+    db: &dyn DefDatabase,
+    item: ItemInNs,
+    from: ModuleId,
+    prefix_kind: PrefixKind,
+) -> Option<ModPath> {
+    let _p = profile::span("find_path_prefixed");
+    find_path_inner(db, item, from, MAX_PATH_LEN, Some(prefix_kind))
 }
 
 const MAX_PATH_LEN: usize = 15;
@@ -36,11 +47,61 @@ impl ModPath {
     }
 }
 
+fn check_self_super(def_map: &CrateDefMap, item: ItemInNs, from: ModuleId) -> Option<ModPath> {
+    if item == ItemInNs::Types(from.into()) {
+        // - if the item is the module we're in, use `self`
+        Some(ModPath::from_segments(PathKind::Super(0), Vec::new()))
+    } else if let Some(parent_id) = def_map.modules[from.local_id].parent {
+        // - if the item is the parent module, use `super` (this is not used recursively, since `super::super` is ugly)
+        if item
+            == ItemInNs::Types(ModuleDefId::ModuleId(ModuleId {
+                krate: from.krate,
+                local_id: parent_id,
+            }))
+        {
+            Some(ModPath::from_segments(PathKind::Super(1), Vec::new()))
+        } else {
+            None
+        }
+    } else {
+        None
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PrefixKind {
+    /// Causes paths to always start with either `self`, `super`, `crate` or a crate-name.
+    /// This is the same as plain, just that paths will start with `self` iprepended f the path
+    /// starts with an identifier that is not a crate.
+    BySelf,
+    /// Causes paths to ignore imports in the local module.
+    Plain,
+    /// Causes paths to start with `crate` where applicable, effectively forcing paths to be absolute.
+    ByCrate,
+}
+
+impl PrefixKind {
+    #[inline]
+    fn prefix(self) -> PathKind {
+        match self {
+            PrefixKind::BySelf => PathKind::Super(0),
+            PrefixKind::Plain => PathKind::Plain,
+            PrefixKind::ByCrate => PathKind::Crate,
+        }
+    }
+
+    #[inline]
+    fn is_absolute(&self) -> bool {
+        self == &PrefixKind::ByCrate
+    }
+}
+
 fn find_path_inner(
     db: &dyn DefDatabase,
     item: ItemInNs,
     from: ModuleId,
     max_len: usize,
+    prefixed: Option<PrefixKind>,
 ) -> Option<ModPath> {
     if max_len == 0 {
         return None;
@@ -51,8 +112,11 @@ fn find_path_inner(
     // - if the item is already in scope, return the name under which it is
     let def_map = db.crate_def_map(from.krate);
     let from_scope: &crate::item_scope::ItemScope = &def_map.modules[from.local_id].scope;
-    if let Some((name, _)) = from_scope.name_of(item) {
-        return Some(ModPath::from_segments(PathKind::Plain, vec![name.clone()]));
+    let scope_name =
+        if let Some((name, _)) = from_scope.name_of(item) { Some(name.clone()) } else { None };
+    if prefixed.is_none() && scope_name.is_some() {
+        return scope_name
+            .map(|scope_name| ModPath::from_segments(PathKind::Plain, vec![scope_name]));
     }
 
     // - if the item is the crate root, return `crate`
@@ -65,27 +129,17 @@ fn find_path_inner(
         return Some(ModPath::from_segments(PathKind::Crate, Vec::new()));
     }
 
-    // - if the item is the module we're in, use `self`
-    if item == ItemInNs::Types(from.into()) {
-        return Some(ModPath::from_segments(PathKind::Super(0), Vec::new()));
-    }
-
-    // - if the item is the parent module, use `super` (this is not used recursively, since `super::super` is ugly)
-    if let Some(parent_id) = def_map.modules[from.local_id].parent {
-        if item
-            == ItemInNs::Types(ModuleDefId::ModuleId(ModuleId {
-                krate: from.krate,
-                local_id: parent_id,
-            }))
-        {
-            return Some(ModPath::from_segments(PathKind::Super(1), Vec::new()));
+    if prefixed.filter(PrefixKind::is_absolute).is_none() {
+        if let modpath @ Some(_) = check_self_super(&def_map, item, from) {
+            return modpath;
         }
     }
 
     // - if the item is the crate root of a dependency crate, return the name from the extern prelude
     for (name, def_id) in &def_map.extern_prelude {
         if item == ItemInNs::Types(*def_id) {
-            return Some(ModPath::from_segments(PathKind::Plain, vec![name.clone()]));
+            let name = scope_name.unwrap_or_else(|| name.clone());
+            return Some(ModPath::from_segments(PathKind::Plain, vec![name]));
         }
     }
 
@@ -138,6 +192,7 @@ fn find_path_inner(
                 ItemInNs::Types(ModuleDefId::ModuleId(module_id)),
                 from,
                 best_path_len - 1,
+                prefixed,
             ) {
                 path.segments.push(name);
 
@@ -165,7 +220,9 @@ fn find_path_inner(
                     ItemInNs::Types(ModuleDefId::ModuleId(info.container)),
                     from,
                     best_path_len - 1,
+                    prefixed,
                 )?;
+                mark::hit!(partially_imported);
                 path.segments.push(info.path.segments.last().unwrap().clone());
                 Some(path)
             })
@@ -181,7 +238,13 @@ fn find_path_inner(
         }
     }
 
-    best_path
+    if let Some(prefix) = prefixed.map(PrefixKind::prefix) {
+        best_path.or_else(|| {
+            scope_name.map(|scope_name| ModPath::from_segments(prefix, vec![scope_name]))
+        })
+    } else {
+        best_path
+    }
 }
 
 fn select_best_path(old_path: ModPath, new_path: ModPath, prefer_no_std: bool) -> ModPath {
@@ -304,7 +367,7 @@ mod tests {
     /// `code` needs to contain a cursor marker; checks that `find_path` for the
     /// item the `path` refers to returns that same path when called from the
     /// module the cursor is in.
-    fn check_found_path(ra_fixture: &str, path: &str) {
+    fn check_found_path_(ra_fixture: &str, path: &str, prefix_kind: Option<PrefixKind>) {
         let (db, pos) = TestDB::with_position(ra_fixture);
         let module = db.module_for_file(pos.file_id);
         let parsed_path_file = syntax::SourceFile::parse(&format!("use {};", path));
@@ -324,9 +387,22 @@ mod tests {
             .take_types()
             .unwrap();
 
-        let found_path = find_path(&db, ItemInNs::Types(resolved), module);
+        let found_path =
+            find_path_inner(&db, ItemInNs::Types(resolved), module, MAX_PATH_LEN, prefix_kind);
+        assert_eq!(found_path, Some(mod_path), "{:?}", prefix_kind);
+    }
 
-        assert_eq!(found_path, Some(mod_path));
+    fn check_found_path(
+        ra_fixture: &str,
+        unprefixed: &str,
+        prefixed: &str,
+        absolute: &str,
+        self_prefixed: &str,
+    ) {
+        check_found_path_(ra_fixture, unprefixed, None);
+        check_found_path_(ra_fixture, prefixed, Some(PrefixKind::Plain));
+        check_found_path_(ra_fixture, absolute, Some(PrefixKind::ByCrate));
+        check_found_path_(ra_fixture, self_prefixed, Some(PrefixKind::BySelf));
     }
 
     #[test]
@@ -336,7 +412,7 @@ mod tests {
             struct S;
             <|>
         "#;
-        check_found_path(code, "S");
+        check_found_path(code, "S", "S", "crate::S", "self::S");
     }
 
     #[test]
@@ -346,7 +422,7 @@ mod tests {
             enum E { A }
             <|>
         "#;
-        check_found_path(code, "E::A");
+        check_found_path(code, "E::A", "E::A", "E::A", "E::A");
     }
 
     #[test]
@@ -358,7 +434,7 @@ mod tests {
             }
             <|>
         "#;
-        check_found_path(code, "foo::S");
+        check_found_path(code, "foo::S", "foo::S", "crate::foo::S", "self::foo::S");
     }
 
     #[test]
@@ -372,7 +448,7 @@ mod tests {
             //- /foo/bar.rs
             <|>
         "#;
-        check_found_path(code, "super::S");
+        check_found_path(code, "super::S", "super::S", "crate::foo::S", "super::S");
     }
 
     #[test]
@@ -383,7 +459,7 @@ mod tests {
             //- /foo.rs
             <|>
         "#;
-        check_found_path(code, "self");
+        check_found_path(code, "self", "self", "crate::foo", "self");
     }
 
     #[test]
@@ -394,7 +470,7 @@ mod tests {
             //- /foo.rs
             <|>
         "#;
-        check_found_path(code, "crate");
+        check_found_path(code, "crate", "crate", "crate", "crate");
     }
 
     #[test]
@@ -406,7 +482,7 @@ mod tests {
             //- /foo.rs
             <|>
         "#;
-        check_found_path(code, "crate::S");
+        check_found_path(code, "crate::S", "crate::S", "crate::S", "crate::S");
     }
 
     #[test]
@@ -417,7 +493,7 @@ mod tests {
             //- /std.rs crate:std
             pub struct S;
         "#;
-        check_found_path(code, "std::S");
+        check_found_path(code, "std::S", "std::S", "std::S", "std::S");
     }
 
     #[test]
@@ -429,15 +505,21 @@ mod tests {
             //- /std.rs crate:std
             pub struct S;
         "#;
-        check_found_path(code, "std_renamed::S");
+        check_found_path(
+            code,
+            "std_renamed::S",
+            "std_renamed::S",
+            "std_renamed::S",
+            "std_renamed::S",
+        );
     }
 
     #[test]
     fn partially_imported() {
+        mark::check!(partially_imported);
         // Tests that short paths are used even for external items, when parts of the path are
         // already in scope.
-        check_found_path(
-            r#"
+        let code = r#"
             //- /main.rs crate:main deps:syntax
 
             use syntax::ast;
@@ -449,12 +531,16 @@ mod tests {
                     A, B, C,
                 }
             }
-        "#,
+        "#;
+        check_found_path(
+            code,
             "ast::ModuleItem",
+            "syntax::ast::ModuleItem",
+            "syntax::ast::ModuleItem",
+            "syntax::ast::ModuleItem",
         );
 
-        check_found_path(
-            r#"
+        let code = r#"
             //- /main.rs crate:main deps:syntax
 
             <|>
@@ -465,7 +551,12 @@ mod tests {
                     A, B, C,
                 }
             }
-        "#,
+        "#;
+        check_found_path(
+            code,
+            "syntax::ast::ModuleItem",
+            "syntax::ast::ModuleItem",
+            "syntax::ast::ModuleItem",
             "syntax::ast::ModuleItem",
         );
     }
@@ -480,7 +571,7 @@ mod tests {
             }
             <|>
         "#;
-        check_found_path(code, "bar::S");
+        check_found_path(code, "bar::S", "bar::S", "crate::bar::S", "self::bar::S");
     }
 
     #[test]
@@ -493,7 +584,7 @@ mod tests {
             }
             <|>
         "#;
-        check_found_path(code, "bar::U");
+        check_found_path(code, "bar::U", "bar::U", "crate::bar::U", "self::bar::U");
     }
 
     #[test]
@@ -506,7 +597,7 @@ mod tests {
             //- /core.rs crate:core
             pub struct S;
         "#;
-        check_found_path(code, "std::S");
+        check_found_path(code, "std::S", "std::S", "std::S", "std::S");
     }
 
     #[test]
@@ -519,7 +610,7 @@ mod tests {
             #[prelude_import]
             pub use prelude::*;
         "#;
-        check_found_path(code, "S");
+        check_found_path(code, "S", "S", "S", "S");
     }
 
     #[test]
@@ -535,8 +626,8 @@ mod tests {
             #[prelude_import]
             pub use prelude::*;
         "#;
-        check_found_path(code, "None");
-        check_found_path(code, "Some");
+        check_found_path(code, "None", "None", "None", "None");
+        check_found_path(code, "Some", "Some", "Some", "Some");
     }
 
     #[test]
@@ -552,7 +643,7 @@ mod tests {
             //- /baz.rs
             pub use crate::foo::bar::S;
         "#;
-        check_found_path(code, "baz::S");
+        check_found_path(code, "baz::S", "baz::S", "crate::baz::S", "self::baz::S");
     }
 
     #[test]
@@ -566,7 +657,7 @@ mod tests {
             <|>
         "#;
         // crate::S would be shorter, but using private imports seems wrong
-        check_found_path(code, "crate::bar::S");
+        check_found_path(code, "crate::bar::S", "crate::bar::S", "crate::bar::S", "crate::bar::S");
     }
 
     #[test]
@@ -584,7 +675,7 @@ mod tests {
             //- /baz.rs
             pub use super::foo;
         "#;
-        check_found_path(code, "crate::foo::S");
+        check_found_path(code, "crate::foo::S", "crate::foo::S", "crate::foo::S", "crate::foo::S");
     }
 
     #[test]
@@ -604,7 +695,13 @@ mod tests {
             pub struct Arc;
         }
         "#;
-        check_found_path(code, "std::sync::Arc");
+        check_found_path(
+            code,
+            "std::sync::Arc",
+            "std::sync::Arc",
+            "std::sync::Arc",
+            "std::sync::Arc",
+        );
     }
 
     #[test]
@@ -628,7 +725,13 @@ mod tests {
             pub struct Error;
         }
         "#;
-        check_found_path(code, "core::fmt::Error");
+        check_found_path(
+            code,
+            "core::fmt::Error",
+            "core::fmt::Error",
+            "core::fmt::Error",
+            "core::fmt::Error",
+        );
     }
 
     #[test]
@@ -651,7 +754,13 @@ mod tests {
             pub struct Arc;
         }
         "#;
-        check_found_path(code, "alloc::sync::Arc");
+        check_found_path(
+            code,
+            "alloc::sync::Arc",
+            "alloc::sync::Arc",
+            "alloc::sync::Arc",
+            "alloc::sync::Arc",
+        );
     }
 
     #[test]
@@ -668,7 +777,13 @@ mod tests {
         //- /zzz.rs crate:megaalloc
         pub struct Arc;
         "#;
-        check_found_path(code, "megaalloc::Arc");
+        check_found_path(
+            code,
+            "megaalloc::Arc",
+            "megaalloc::Arc",
+            "megaalloc::Arc",
+            "megaalloc::Arc",
+        );
     }
 
     #[test]
@@ -681,7 +796,7 @@ mod tests {
             pub use u8;
         }
         "#;
-        check_found_path(code, "u8");
-        check_found_path(code, "u16");
+        check_found_path(code, "u8", "u8", "u8", "u8");
+        check_found_path(code, "u16", "u16", "u16", "u16");
     }
 }

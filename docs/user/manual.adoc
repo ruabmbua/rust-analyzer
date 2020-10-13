@@ -44,6 +44,11 @@ https://github.com/rust-analyzer/rust-analyzer/tree/master/editors/code[in tree]
 
 You can install the latest release of the plugin from
 https://marketplace.visualstudio.com/items?itemName=matklad.rust-analyzer[the marketplace].
+
+Note that the plugin may cause conflicts with the
+https://marketplace.visualstudio.com/items?itemName=rust-lang.rust[official Rust plugin]. It is
+recommended to disable the Rust plugin when using the rust-analyzer extension.
+
 By default, the plugin will prompt you to download the matching version of the server as well:
 
 image::https://user-images.githubusercontent.com/9021944/75067008-17502500-54ba-11ea-835a-f92aac50e866.png[]
@@ -61,6 +66,7 @@ To disable this notification put the following to `settings.json`
 The server binary is stored in:
 
 * Linux: `~/.config/Code/User/globalStorage/matklad.rust-analyzer`
+* Linux (Remote, such as WSL): `~/.vscode-server/data/User/globalStorage/matklad.rust-analyzer`
 * macOS: `~/Library/Application\ Support/Code/User/globalStorage/matklad.rust-analyzer`
 * Windows: `%APPDATA%\Code\User\globalStorage\matklad.rust-analyzer`
 
@@ -107,8 +113,8 @@ Note that installing via `xtask install` does not work for VS Code Remote, inste
 
 Here are some useful self-diagnostic commands:
 
-* **Rust Analyzer: Show RA Version** shows the version of `rust-analyzer` binary
-* **Rust Analyzer: Status** prints some statistics about the server, like the few latest LSP requests
+* **Rust Analyzer: Show RA Version** shows the version of `rust-analyzer` binary.
+* **Rust Analyzer: Status** prints some statistics about the server, and dependency information for the current file.
 * To enable server-side logging, run with `env RA_LOG=info` and see `Output > Rust Analyzer Language Server` in VS Code's panel.
 * To log all LSP requests, add `"rust-analyzer.trace.server": "verbose"` to the settings and look for `Rust Analyzer Language Server Trace` in the panel.
 * To enable client-side logging, add `"rust-analyzer.trace.extension": true` to the settings and open `Output > Rust Analyzer Client` in the panel.
@@ -273,9 +279,19 @@ However, if you use some other build system, you'll have to describe the structu
 [source,TypeScript]
 ----
 interface JsonProject {
-   /// The set of crates comprising the current project.
-   /// Must include all transitive dependencies as well as sysroot crate (libstd, libcore and such).
-   crates: Crate[];
+    /// Path to the directory with *source code* of sysroot crates.
+    ///
+    /// It should point to the directory where std, core, and friends can be found:
+    /// https://github.com/rust-lang/rust/tree/master/library.
+    ///
+    /// If provided, rust-analyzer automatically adds dependencies on sysroot
+    /// crates. Conversely, if you omit this path, you can specify sysroot
+    /// dependencies yourself and, for example, have several different "sysroots" in
+    /// one graph of crates.
+    sysroot_src?: string;
+    /// The set of crates comprising the current project.
+    /// Must include all transitive dependencies as well as sysroot crate (libstd, libcore and such).
+    crates: Crate[];
 }
 
 interface Crate {
@@ -341,6 +357,8 @@ Relative paths are interpreted relative to `rust-project.json` file location or 
 
 See https://github.com/rust-analyzer/rust-project.json-example for a small example.
 
+You can set `RA_LOG` environmental variable to `rust_analyzer=info` to inspect how rust-analyzer handles config and project loading.
+
 == Features
 
 include::./generated_features.adoc[]
@@ -355,6 +373,47 @@ include::./generated_assists.adoc[]
 
 == Editor Features
 === VS Code
+
+==== Color configurations
+
+It is possible to change the foreground/background color of inlay hints. Just add this to your
+`settings.json`:
+
+[source,jsonc]
+----
+{
+  "workbench.colorCustomizations": {
+    // Name of the theme you are currently using
+    "[Default Dark+]": {
+      "rust_analyzer.inlayHints.foreground": "#868686f0",
+      "rust_analyzer.inlayHints.background": "#3d3d3d48",
+
+      // Overrides for specific kinds of inlay hints
+      "rust_analyzer.inlayHints.foreground.typeHints": "#fdb6fdf0",
+      "rust_analyzer.inlayHints.foreground.paramHints": "#fdb6fdf0",
+      "rust_analyzer.inlayHints.background.chainingHints": "#6b0c0c81"
+    }
+  }
+}
+----
+
+==== Semantic style customizations
+
+You can customize the look of different semantic elements in the source code. For example, mutable bindings are underlined by default and you can override this behavior by adding the following section to your `settings.json`:
+
+[source,jsonc]
+----
+{
+  "editor.semanticTokenColorCustomizations": {
+    "rules": {
+      "*.mutable": {
+        "fontStyle": "", // underline is the default
+      },
+    }
+  },
+}
+----
+
 ==== Special `when` clause context for keybindings.
 You may use `inRustProject` context to configure keybindings for rust projects only. For example:
 [source,json]

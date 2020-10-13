@@ -70,7 +70,7 @@ impl<'a> InferenceContext<'a> {
             let matching_field = var_data.as_ref().and_then(|it| it.field(&subpat.name));
             if let Some(local_id) = matching_field {
                 let field_def = FieldId { parent: def.unwrap(), local_id };
-                self.result.record_field_pat_resolutions.insert(subpat.pat, field_def);
+                self.result.record_pat_field_resolutions.insert(subpat.pat, field_def);
             }
 
             let expected_ty =
@@ -209,6 +209,18 @@ impl<'a> InferenceContext<'a> {
                 end_ty
             }
             Pat::Lit(expr) => self.infer_expr(*expr, &Expectation::has_type(expected.clone())),
+            Pat::Box { inner } => match self.resolve_boxed_box() {
+                Some(box_adt) => {
+                    let inner_expected = match expected.as_adt() {
+                        Some((adt, substs)) if adt == box_adt => substs.as_single(),
+                        _ => &Ty::Unknown,
+                    };
+
+                    let inner_ty = self.infer_pat(*inner, inner_expected, default_bm);
+                    Ty::apply_one(TypeCtor::Adt(box_adt), inner_ty)
+                }
+                None => Ty::Unknown,
+            },
             Pat::Missing => Ty::Unknown,
         };
         // use a new type variable if we got Ty::Unknown here
@@ -236,6 +248,6 @@ fn is_non_ref_pat(body: &hir_def::body::Body, pat: PatId) -> bool {
             Expr::Literal(Literal::String(..)) => false,
             _ => true,
         },
-        Pat::Wild | Pat::Bind { .. } | Pat::Ref { .. } | Pat::Missing => false,
+        Pat::Wild | Pat::Bind { .. } | Pat::Ref { .. } | Pat::Box { .. } | Pat::Missing => false,
     }
 }

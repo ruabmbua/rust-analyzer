@@ -21,20 +21,52 @@ pub fn ty(text: &str) -> ast::Type {
     ast_from_text(&format!("impl {} for D {{}};", text))
 }
 
+pub fn assoc_item_list() -> ast::AssocItemList {
+    ast_from_text("impl C for D {};")
+}
+
 pub fn path_segment(name_ref: ast::NameRef) -> ast::PathSegment {
     ast_from_text(&format!("use {};", name_ref))
 }
+
 pub fn path_segment_self() -> ast::PathSegment {
     ast_from_text("use self;")
 }
+
+pub fn path_segment_super() -> ast::PathSegment {
+    ast_from_text("use super;")
+}
+
+pub fn path_segment_crate() -> ast::PathSegment {
+    ast_from_text("use crate;")
+}
+
 pub fn path_unqualified(segment: ast::PathSegment) -> ast::Path {
-    path_from_text(&format!("use {}", segment))
+    ast_from_text(&format!("use {}", segment))
 }
+
 pub fn path_qualified(qual: ast::Path, segment: ast::PathSegment) -> ast::Path {
-    path_from_text(&format!("{}::{}", qual, segment))
+    ast_from_text(&format!("{}::{}", qual, segment))
 }
-pub fn path_from_text(text: &str) -> ast::Path {
-    ast_from_text(text)
+
+pub fn path_concat(first: ast::Path, second: ast::Path) -> ast::Path {
+    ast_from_text(&format!("{}::{}", first, second))
+}
+
+pub fn path_from_segments(
+    segments: impl IntoIterator<Item = ast::PathSegment>,
+    is_abs: bool,
+) -> ast::Path {
+    let segments = segments.into_iter().map(|it| it.syntax().clone()).join("::");
+    ast_from_text(&if is_abs {
+        format!("use ::{};", segments)
+    } else {
+        format!("use {};", segments)
+    })
+}
+
+pub fn glob_use_tree() -> ast::UseTree {
+    ast_from_text("use *;")
 }
 
 pub fn use_tree(
@@ -137,12 +169,11 @@ pub fn expr_prefix(op: SyntaxKind, expr: ast::Expr) -> ast::Expr {
 pub fn expr_call(f: ast::Expr, arg_list: ast::ArgList) -> ast::Expr {
     expr_from_text(&format!("{}{}", f, arg_list))
 }
+pub fn expr_method_call(receiver: ast::Expr, method: &str, arg_list: ast::ArgList) -> ast::Expr {
+    expr_from_text(&format!("{}.{}{}", receiver, method, arg_list))
+}
 fn expr_from_text(text: &str) -> ast::Expr {
     ast_from_text(&format!("const C: () = {};", text))
-}
-
-pub fn try_expr_from_text(text: &str) -> Option<ast::Expr> {
-    try_ast_from_text(&format!("const C: () = {};", text))
 }
 
 pub fn condition(expr: ast::Expr, pattern: Option<ast::Pat>) -> ast::Condition {
@@ -289,9 +320,28 @@ pub fn param(name: String, ty: String) -> ast::Param {
     ast_from_text(&format!("fn f({}: {}) {{ }}", name, ty))
 }
 
+pub fn ret_type(ty: ast::Type) -> ast::RetType {
+    ast_from_text(&format!("fn f() -> {} {{ }}", ty))
+}
+
 pub fn param_list(pats: impl IntoIterator<Item = ast::Param>) -> ast::ParamList {
     let args = pats.into_iter().join(", ");
     ast_from_text(&format!("fn f({}) {{ }}", args))
+}
+
+pub fn generic_param(name: String, ty: Option<ast::TypeBoundList>) -> ast::GenericParam {
+    let bound = match ty {
+        Some(it) => format!(": {}", it),
+        None => String::new(),
+    };
+    ast_from_text(&format!("fn f<{}{}>() {{ }}", name, bound))
+}
+
+pub fn generic_param_list(
+    pats: impl IntoIterator<Item = ast::GenericParam>,
+) -> ast::GenericParamList {
+    let args = pats.into_iter().join(", ");
+    ast_from_text(&format!("fn f<{}>() {{ }}", args))
 }
 
 pub fn visibility_pub_crate() -> ast::Visibility {
@@ -304,14 +354,20 @@ pub fn fn_(
     type_params: Option<ast::GenericParamList>,
     params: ast::ParamList,
     body: ast::BlockExpr,
+    ret_type: Option<ast::RetType>,
 ) -> ast::Fn {
     let type_params =
         if let Some(type_params) = type_params { format!("<{}>", type_params) } else { "".into() };
+    let ret_type = if let Some(ret_type) = ret_type { format!("{} ", ret_type) } else { "".into() };
     let visibility = match visibility {
         None => String::new(),
         Some(it) => format!("{} ", it),
     };
-    ast_from_text(&format!("{}fn {}{}{} {}", visibility, fn_name, type_params, params, body))
+
+    ast_from_text(&format!(
+        "{}fn {}{}{} {}{}",
+        visibility, fn_name, type_params, params, ret_type, body
+    ))
 }
 
 fn ast_from_text<N: AstNode>(text: &str) -> N {
@@ -329,16 +385,6 @@ fn ast_from_text<N: AstNode>(text: &str) -> N {
     node
 }
 
-fn try_ast_from_text<N: AstNode>(text: &str) -> Option<N> {
-    let parse = SourceFile::parse(text);
-    let node = parse.tree().syntax().descendants().find_map(N::cast)?;
-    let node = node.syntax().clone();
-    let node = unroot(node);
-    let node = N::cast(node).unwrap();
-    assert_eq!(node.syntax().text_range().start(), 0.into());
-    Some(node)
-}
-
 fn unroot(n: SyntaxNode) -> SyntaxNode {
     SyntaxNode::new_root(n.green().clone())
 }
@@ -349,7 +395,7 @@ pub mod tokens {
     use crate::{ast, AstNode, Parse, SourceFile, SyntaxKind::*, SyntaxToken};
 
     pub(super) static SOURCE_FILE: Lazy<Parse<SourceFile>> =
-        Lazy::new(|| SourceFile::parse("const C: <()>::Item = (1 != 1, 2 == 2, !true)\n;"));
+        Lazy::new(|| SourceFile::parse("const C: <()>::Item = (1 != 1, 2 == 2, !true)\n;\n\n"));
 
     pub fn single_space() -> SyntaxToken {
         SOURCE_FILE
@@ -386,6 +432,16 @@ pub mod tokens {
             .descendants_with_tokens()
             .filter_map(|it| it.into_token())
             .find(|it| it.kind() == WHITESPACE && it.text().as_str() == "\n")
+            .unwrap()
+    }
+
+    pub fn blank_line() -> SyntaxToken {
+        SOURCE_FILE
+            .tree()
+            .syntax()
+            .descendants_with_tokens()
+            .filter_map(|it| it.into_token())
+            .find(|it| it.kind() == WHITESPACE && it.text().as_str() == "\n\n")
             .unwrap()
     }
 

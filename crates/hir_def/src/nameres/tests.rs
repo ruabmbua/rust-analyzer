@@ -2,6 +2,7 @@ mod globs;
 mod incremental;
 mod macros;
 mod mod_resolution;
+mod diagnostics;
 mod primitives;
 
 use std::sync::Arc;
@@ -46,6 +47,7 @@ union U { to_be: bool, not_to_be: u8 }
 enum E { V }
 
 extern {
+    type Ext;
     static EXT: u8;
     fn ext();
 }
@@ -65,6 +67,7 @@ extern {
             Baz: t v
             E: t
             EXT: v
+            Ext: t
             U: t
             ext: v
         "#]],

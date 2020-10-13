@@ -2,14 +2,14 @@
 use std::{iter, sync::Arc};
 
 use arrayvec::ArrayVec;
-use base_db::{CrateId, Edition, FileId};
+use base_db::{CrateId, CrateName, Edition, FileId};
 use either::Either;
+use hir_def::find_path::PrefixKind;
 use hir_def::{
     adt::ReprKind,
     adt::StructKind,
     adt::VariantData,
     builtin_type::BuiltinType,
-    docs::Documentation,
     expr::{BindingAnnotation, Pat, PatId},
     import_map,
     lang_item::LangItemTarget,
@@ -18,9 +18,9 @@ use hir_def::{
     resolver::{HasResolver, Resolver},
     src::HasSource as _,
     type_ref::{Mutability, TypeRef},
-    AdtId, AssocContainerId, ConstId, DefWithBodyId, EnumId, FunctionId, GenericDefId, HasModule,
-    ImplId, LocalEnumVariantId, LocalFieldId, LocalModuleId, Lookup, ModuleId, StaticId, StructId,
-    TraitId, TypeAliasId, TypeParamId, UnionId,
+    AdtId, AssocContainerId, AttrDefId, ConstId, DefWithBodyId, EnumId, FunctionId, GenericDefId,
+    HasModule, ImplId, LocalEnumVariantId, LocalFieldId, LocalModuleId, Lookup, ModuleId, StaticId,
+    StructId, TraitId, TypeAliasId, TypeParamId, UnionId,
 };
 use hir_expand::{
     diagnostics::DiagnosticSink,
@@ -30,8 +30,12 @@ use hir_expand::{
 use hir_ty::{
     autoderef,
     display::{HirDisplayError, HirFormatter},
-    method_resolution, ApplicationTy, CallableDefId, Canonical, FnSig, GenericPredicate,
-    InEnvironment, Substs, TraitEnvironment, Ty, TyDefId, TypeCtor,
+    method_resolution,
+    traits::Solution,
+    traits::SolutionVariables,
+    ApplicationTy, BoundVar, CallableDefId, Canonical, DebruijnIndex, FnSig, GenericPredicate,
+    InEnvironment, Obligation, ProjectionPredicate, ProjectionTy, Substs, TraitEnvironment, Ty,
+    TyDefId, TyKind, TypeCtor,
 };
 use rustc_hash::FxHashSet;
 use stdx::impl_from;
@@ -39,6 +43,7 @@ use syntax::{
     ast::{self, AttrsOwner, NameOwner},
     AstNode, SmolStr,
 };
+use tt::{Ident, Leaf, Literal, TokenTree};
 
 use crate::{
     db::{DefDatabase, HirDatabase},
@@ -98,8 +103,8 @@ impl Crate {
         db.crate_graph()[self.id].edition
     }
 
-    pub fn display_name(self, db: &dyn HirDatabase) -> Option<String> {
-        db.crate_graph()[self.id].display_name.clone()
+    pub fn declaration_name(self, db: &dyn HirDatabase) -> Option<CrateName> {
+        db.crate_graph()[self.id].declaration_name.clone()
     }
 
     pub fn query_external_importables(
@@ -121,6 +126,31 @@ impl Crate {
 
     pub fn all(db: &dyn HirDatabase) -> Vec<Crate> {
         db.crate_graph().iter().map(|id| Crate { id }).collect()
+    }
+
+    /// Try to get the root URL of the documentation of a crate.
+    pub fn get_html_root_url(self: &Crate, db: &dyn HirDatabase) -> Option<String> {
+        // Look for #![doc(html_root_url = "...")]
+        let attrs = db.attrs(AttrDefId::ModuleId(self.root_module(db).into()));
+        let doc_attr_q = attrs.by_key("doc");
+
+        if !doc_attr_q.exists() {
+            return None;
+        }
+
+        let doc_url = doc_attr_q.tt_values().map(|tt| {
+            let name = tt.token_trees.iter()
+                .skip_while(|tt| !matches!(tt, TokenTree::Leaf(Leaf::Ident(Ident{text: ref ident, ..})) if ident == "html_root_url"))
+                .skip(2)
+                .next();
+
+            match name {
+                Some(TokenTree::Leaf(Leaf::Literal(Literal{ref text, ..}))) => Some(text),
+                _ => None
+            }
+        }).flat_map(|t| t).next();
+
+        doc_url.map(|s| s.trim_matches('"').trim_end_matches('/').to_owned() + "/")
     }
 }
 
@@ -156,6 +186,16 @@ impl_from!(
     for ModuleDef
 );
 
+impl From<VariantDef> for ModuleDef {
+    fn from(var: VariantDef) -> Self {
+        match var {
+            VariantDef::Struct(t) => Adt::from(t).into(),
+            VariantDef::Union(t) => Adt::from(t).into(),
+            VariantDef::EnumVariant(t) => t.into(),
+        }
+    }
+}
+
 impl ModuleDef {
     pub fn module(self, db: &dyn HirDatabase) -> Option<Module> {
         match self {
@@ -169,6 +209,16 @@ impl ModuleDef {
             ModuleDef::TypeAlias(it) => Some(it.module(db)),
             ModuleDef::BuiltinType(_) => None,
         }
+    }
+
+    pub fn canonical_path(&self, db: &dyn HirDatabase) -> Option<String> {
+        let mut segments = Vec::new();
+        segments.push(self.name(db)?.to_string());
+        for m in self.module(db)?.path_to_root(db) {
+            segments.extend(m.name(db).map(|it| it.to_string()))
+        }
+        segments.reverse();
+        Some(segments.join("::"))
     }
 
     pub fn definition_visibility(&self, db: &dyn HirDatabase) -> Option<Visibility> {
@@ -198,13 +248,31 @@ impl ModuleDef {
             ModuleDef::Function(it) => Some(it.name(db)),
             ModuleDef::EnumVariant(it) => Some(it.name(db)),
             ModuleDef::TypeAlias(it) => Some(it.name(db)),
-
             ModuleDef::Module(it) => it.name(db),
             ModuleDef::Const(it) => it.name(db),
             ModuleDef::Static(it) => it.name(db),
 
             ModuleDef::BuiltinType(it) => Some(it.as_name()),
         }
+    }
+
+    pub fn diagnostics(self, db: &dyn HirDatabase, sink: &mut DiagnosticSink) {
+        let id = match self {
+            ModuleDef::Adt(it) => match it {
+                Adt::Struct(it) => it.id.into(),
+                Adt::Enum(it) => it.id.into(),
+                Adt::Union(it) => it.id.into(),
+            },
+            ModuleDef::Trait(it) => it.id.into(),
+            ModuleDef::Function(it) => it.id.into(),
+            ModuleDef::TypeAlias(it) => it.id.into(),
+            ModuleDef::Module(it) => it.id.into(),
+            ModuleDef::Const(it) => it.id.into(),
+            ModuleDef::Static(it) => it.id.into(),
+            _ => return,
+        };
+
+        hir_ty::diagnostics::validate_module_item(db, id, sink)
     }
 }
 
@@ -309,6 +377,8 @@ impl Module {
         let crate_def_map = db.crate_def_map(self.id.krate);
         crate_def_map.add_diagnostics(db.upcast(), self.id.local_id, sink);
         for decl in self.declarations(db) {
+            decl.diagnostics(db, sink);
+
             match decl {
                 crate::ModuleDef::Function(f) => f.diagnostics(db, sink),
                 crate::ModuleDef::Module(m) => {
@@ -348,6 +418,17 @@ impl Module {
     /// this module, if possible.
     pub fn find_use_path(self, db: &dyn DefDatabase, item: impl Into<ItemInNs>) -> Option<ModPath> {
         hir_def::find_path::find_path(db, item.into(), self.into())
+    }
+
+    /// Finds a path that can be used to refer to the given item from within
+    /// this module, if possible. This is used for returning import paths for use-statements.
+    pub fn find_use_path_prefixed(
+        self,
+        db: &dyn DefDatabase,
+        item: impl Into<ItemInNs>,
+        prefix_kind: PrefixKind,
+    ) -> Option<ModPath> {
+        hir_def::find_path::find_path_prefixed(db, item.into(), self.into(), prefix_kind)
     }
 }
 
@@ -675,11 +756,23 @@ impl Function {
     }
 
     pub fn params(self, db: &dyn HirDatabase) -> Vec<Param> {
+        let resolver = self.id.resolver(db.upcast());
+        let ctx = hir_ty::TyLoweringContext::new(db, &resolver);
+        let environment = TraitEnvironment::lower(db, &resolver);
         db.function_data(self.id)
             .params
             .iter()
             .skip(if self.self_param(db).is_some() { 1 } else { 0 })
-            .map(|_| Param { _ty: () })
+            .map(|type_ref| {
+                let ty = Type {
+                    krate: self.id.lookup(db.upcast()).container.module(db.upcast()).krate,
+                    ty: InEnvironment {
+                        value: Ty::from_hir_ext(&ctx, type_ref).0,
+                        environment: environment.clone(),
+                    },
+                };
+                Param { ty }
+            })
             .collect()
     }
 
@@ -688,7 +781,15 @@ impl Function {
     }
 
     pub fn diagnostics(self, db: &dyn HirDatabase, sink: &mut DiagnosticSink) {
-        hir_ty::diagnostics::validate_body(db, self.id.into(), sink)
+        hir_ty::diagnostics::validate_module_item(db, self.id.into(), sink);
+        hir_ty::diagnostics::validate_body(db, self.id.into(), sink);
+    }
+
+    /// Whether this function declaration has a definition.
+    ///
+    /// This is false in the case of required (not provided) trait methods.
+    pub fn has_body(self, db: &dyn HirDatabase) -> bool {
+        db.function_data(self.id).has_body
     }
 }
 
@@ -708,13 +809,19 @@ impl From<Mutability> for Access {
     }
 }
 
+pub struct Param {
+    ty: Type,
+}
+
+impl Param {
+    pub fn ty(&self) -> &Type {
+        &self.ty
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SelfParam {
     func: FunctionId,
-}
-
-pub struct Param {
-    _ty: (),
 }
 
 impl SelfParam {
@@ -874,12 +981,12 @@ impl MacroDef {
 
     /// Indicate it is a proc-macro
     pub fn is_proc_macro(&self) -> bool {
-        matches!(self.id.kind, MacroDefKind::CustomDerive(_))
+        matches!(self.id.kind, MacroDefKind::ProcMacro(_))
     }
 
     /// Indicate it is a derive macro
     pub fn is_derive_macro(&self) -> bool {
-        matches!(self.id.kind, MacroDefKind::CustomDerive(_) | MacroDefKind::BuiltInDerive(_))
+        matches!(self.id.kind, MacroDefKind::ProcMacro(_) | MacroDefKind::BuiltInDerive(_))
     }
 }
 
@@ -1242,6 +1349,14 @@ impl Type {
         )
     }
 
+    pub fn remove_ref(&self) -> Option<Type> {
+        if let Ty::Apply(ApplicationTy { ctor: TypeCtor::Ref(_), .. }) = self.ty.value {
+            self.ty.value.substs().map(|substs| self.derived(substs[0].clone()))
+        } else {
+            None
+        }
+    }
+
     pub fn is_unknown(&self) -> bool {
         matches!(self.ty.value, Ty::Unknown)
     }
@@ -1249,6 +1364,8 @@ impl Type {
     /// Checks that particular type `ty` implements `std::future::Future`.
     /// This function is used in `.await` syntax completion.
     pub fn impls_future(&self, db: &dyn HirDatabase) -> bool {
+        // No special case for the type of async block, since Chalk can figure it out.
+
         let krate = self.krate;
 
         let std_future_trait =
@@ -1286,6 +1403,39 @@ impl Type {
         };
 
         db.trait_solve(self.krate, goal).is_some()
+    }
+
+    pub fn normalize_trait_assoc_type(
+        &self,
+        db: &dyn HirDatabase,
+        r#trait: Trait,
+        args: &[Type],
+        alias: TypeAlias,
+    ) -> Option<Type> {
+        let subst = Substs::build_for_def(db, r#trait.id)
+            .push(self.ty.value.clone())
+            .fill(args.iter().map(|t| t.ty.value.clone()))
+            .build();
+        let predicate = ProjectionPredicate {
+            projection_ty: ProjectionTy { associated_ty: alias.id, parameters: subst },
+            ty: Ty::Bound(BoundVar::new(DebruijnIndex::INNERMOST, 0)),
+        };
+        let goal = Canonical {
+            value: InEnvironment::new(
+                self.ty.environment.clone(),
+                Obligation::Projection(predicate),
+            ),
+            kinds: Arc::new([TyKind::General]),
+        };
+
+        match db.trait_solve(self.krate, goal)? {
+            Solution::Unique(SolutionVariables(subst)) => subst.value.first().cloned(),
+            Solution::Ambig(_) => None,
+        }
+        .map(|ty| Type {
+            krate: self.krate,
+            ty: InEnvironment { value: ty, environment: Arc::clone(&self.ty.environment) },
+        })
     }
 
     pub fn is_copy(&self, db: &dyn HirDatabase) -> bool {
@@ -1566,6 +1716,11 @@ impl Type {
                                 cb(type_.derived(ty.clone()));
                             }
                         }
+                        TypeCtor::OpaqueType(..) => {
+                            if let Some(bounds) = ty.impl_trait_bounds(db) {
+                                walk_bounds(db, &type_.derived(ty.clone()), &bounds, cb);
+                            }
+                        }
                         _ => (),
                     }
 
@@ -1712,55 +1867,6 @@ impl ScopeDef {
         }
 
         items
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum AttrDef {
-    Module(Module),
-    Field(Field),
-    Adt(Adt),
-    Function(Function),
-    EnumVariant(EnumVariant),
-    Static(Static),
-    Const(Const),
-    Trait(Trait),
-    TypeAlias(TypeAlias),
-    MacroDef(MacroDef),
-}
-
-impl_from!(
-    Module,
-    Field,
-    Adt(Struct, Enum, Union),
-    EnumVariant,
-    Static,
-    Const,
-    Function,
-    Trait,
-    TypeAlias,
-    MacroDef
-    for AttrDef
-);
-
-pub trait HasAttrs {
-    fn attrs(self, db: &dyn HirDatabase) -> Attrs;
-}
-
-impl<T: Into<AttrDef>> HasAttrs for T {
-    fn attrs(self, db: &dyn HirDatabase) -> Attrs {
-        let def: AttrDef = self.into();
-        db.attrs(def.into())
-    }
-}
-
-pub trait Docs {
-    fn docs(&self, db: &dyn HirDatabase) -> Option<Documentation>;
-}
-impl<T: Into<AttrDef> + Copy> Docs for T {
-    fn docs(&self, db: &dyn HirDatabase) -> Option<Documentation> {
-        let def: AttrDef = (*self).into();
-        db.documentation(def.into())
     }
 }
 

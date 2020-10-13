@@ -107,7 +107,10 @@ impl ExprCollector<'_> {
                 let param_pat = self.alloc_pat(
                     Pat::Bind {
                         name: name![self],
-                        mode: BindingAnnotation::Unannotated,
+                        mode: BindingAnnotation::new(
+                            self_param.mut_token().is_some() && self_param.amp_token().is_none(),
+                            false,
+                        ),
                         subpat: None,
                     },
                     Either::Right(ptr),
@@ -239,7 +242,10 @@ impl ExprCollector<'_> {
                     None => self.missing_expr(),
                 },
                 // FIXME: we need to record these effects somewhere...
-                ast::Effect::Async(_) => self.collect_block_opt(e.block_expr()),
+                ast::Effect::Async(_) => {
+                    let body = self.collect_block_opt(e.block_expr());
+                    self.alloc_expr(Expr::Async { body }, syntax_ptr)
+                }
             },
             ast::Expr::BlockExpr(e) => self.collect_block(e),
             ast::Expr::LoopExpr(e) => {
@@ -835,8 +841,12 @@ impl ExprCollector<'_> {
 
                 Pat::Missing
             }
+            ast::Pat::BoxPat(boxpat) => {
+                let inner = self.collect_pat_opt(boxpat.pat());
+                Pat::Box { inner }
+            }
             // FIXME: implement
-            ast::Pat::BoxPat(_) | ast::Pat::RangePat(_) | ast::Pat::MacroPat(_) => Pat::Missing,
+            ast::Pat::RangePat(_) | ast::Pat::MacroPat(_) => Pat::Missing,
         };
         let ptr = AstPtr::new(&pat);
         self.alloc_pat(pattern, Either::Left(ptr))

@@ -5,10 +5,12 @@ use std::collections::hash_map::Entry;
 
 use base_db::CrateId;
 use hir_expand::name::Name;
+use hir_expand::MacroDefKind;
 use once_cell::sync::Lazy;
 use rustc_hash::{FxHashMap, FxHashSet};
 use test_utils::mark;
 
+use crate::ModuleId;
 use crate::{
     db::DefDatabase, per_ns::PerNs, visibility::Visibility, AdtId, BuiltinType, HasModule, ImplId,
     LocalModuleId, Lookup, MacroDefId, ModuleDefId, TraitId,
@@ -91,6 +93,12 @@ impl ItemScope {
 
     pub fn impls(&self) -> impl Iterator<Item = ImplId> + ExactSizeIterator + '_ {
         self.impls.iter().copied()
+    }
+
+    pub fn values(
+        &self,
+    ) -> impl Iterator<Item = (ModuleDefId, Visibility)> + ExactSizeIterator + '_ {
+        self.values.values().copied()
     }
 
     pub fn visibility_of(&self, def: ModuleDefId) -> Option<Visibility> {
@@ -264,6 +272,26 @@ impl ItemScope {
 
     pub(crate) fn collect_legacy_macros(&self) -> FxHashMap<Name, MacroDefId> {
         self.legacy_macros.clone()
+    }
+
+    /// Marks everything that is not a procedural macro as private to `this_module`.
+    pub(crate) fn censor_non_proc_macros(&mut self, this_module: ModuleId) {
+        self.types
+            .values_mut()
+            .chain(self.values.values_mut())
+            .map(|(_, v)| v)
+            .chain(self.unnamed_trait_imports.values_mut())
+            .for_each(|vis| *vis = Visibility::Module(this_module));
+
+        for (mac, vis) in self.macros.values_mut() {
+            if let MacroDefKind::ProcMacro(_) = mac.kind {
+                // FIXME: Technically this is insufficient since reexports of proc macros are also
+                // forbidden. Practically nobody does that.
+                continue;
+            }
+
+            *vis = Visibility::Module(this_module);
+        }
     }
 }
 

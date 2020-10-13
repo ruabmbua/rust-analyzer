@@ -3,7 +3,7 @@ use std::fs;
 use expect_test::{expect_file, ExpectFile};
 use test_utils::project_dir;
 
-use crate::{mock_analysis::single_file, FileRange, TextRange};
+use crate::{fixture, FileRange, TextRange};
 
 #[test]
 fn test_highlighting() {
@@ -18,7 +18,7 @@ pub mod marker {
     pub trait Copy {}
 }
 
-#[derive(Clone, Debug)]
+
 struct Foo {
     pub x: i32,
     pub y: i32,
@@ -35,8 +35,8 @@ impl Bar for Foo {
 }
 
 impl Foo {
-    fn baz(mut self) -> i32 {
-        self.x
+    fn baz(mut self, f: Foo) -> i32 {
+        f.baz(self)
     }
 
     fn qux(&mut self) {
@@ -48,14 +48,14 @@ impl Foo {
     }
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy)]
 struct FooCopy {
     x: u32,
 }
 
 impl FooCopy {
-    fn baz(self) -> u32 {
-        self.x
+    fn baz(self, f: FooCopy) -> u32 {
+        f.baz(self)
     }
 
     fn qux(&mut self) {
@@ -89,6 +89,10 @@ macro_rules! noop {
     }
 }
 
+macro_rules! keyword_frag {
+    ($type:ty) => ($type)
+}
+
 // comment
 fn main() {
     println!("Hello, {}!", 92);
@@ -118,14 +122,15 @@ fn main() {
     y;
 
     let mut foo = Foo { x, y: x };
+    let foo2 = Foo { x, y: x };
     foo.quop();
     foo.qux();
-    foo.baz();
+    foo.baz(foo2);
 
     let mut copy = FooCopy { x };
     copy.quop();
     copy.qux();
-    copy.baz();
+    copy.baz(copy);
 }
 
 enum Option<T> {
@@ -144,7 +149,7 @@ impl<T> Option<T> {
 }
 "#
         .trim(),
-        expect_file!["crates/ide/test_data/highlighting.html"],
+        expect_file!["./test_data/highlighting.html"],
         false,
     );
 }
@@ -167,7 +172,7 @@ fn bar() {
 }
 "#
         .trim(),
-        expect_file!["crates/ide/test_data/rainbow_highlighting.html"],
+        expect_file!["./test_data/rainbow_highlighting.html"],
         true,
     );
 }
@@ -177,7 +182,7 @@ fn accidentally_quadratic() {
     let file = project_dir().join("crates/syntax/test_data/accidentally_quadratic");
     let src = fs::read_to_string(file).unwrap();
 
-    let (analysis, file_id) = single_file(&src);
+    let (analysis, file_id) = fixture::file(&src);
 
     // let t = std::time::Instant::now();
     let _ = analysis.highlight(file_id).unwrap();
@@ -186,7 +191,7 @@ fn accidentally_quadratic() {
 
 #[test]
 fn test_ranges() {
-    let (analysis, file_id) = single_file(
+    let (analysis, file_id) = fixture::file(
         r#"
 #[derive(Clone, Debug)]
 struct Foo {
@@ -220,14 +225,14 @@ fn main() {
     );
 }"##
         .trim(),
-        expect_file!["crates/ide/test_data/highlight_injection.html"],
+        expect_file!["./test_data/highlight_injection.html"],
         false,
     );
 }
 
 #[test]
 fn ranges_sorted() {
-    let (analysis, file_id) = single_file(
+    let (analysis, file_id) = fixture::file(
         r#"
 #[foo(bar = "bar")]
 macro_rules! test {}
@@ -303,7 +308,7 @@ fn main() {
     println!("{ничоси}", ничоси = 92);
 }"#
         .trim(),
-        expect_file!["crates/ide/test_data/highlight_strings.html"],
+        expect_file!["./test_data/highlight_strings.html"],
         false,
     );
 }
@@ -376,7 +381,7 @@ fn main() {
 }
 "#
         .trim(),
-        expect_file!["crates/ide/test_data/highlight_unsafe.html"],
+        expect_file!["./test_data/highlight_unsafe.html"],
         false,
     );
 }
@@ -452,7 +457,7 @@ macro_rules! noop {
 }
 "#
         .trim(),
-        expect_file!["crates/ide/test_data/highlight_doctest.html"],
+        expect_file!["./test_data/highlight_doctest.html"],
         false,
     );
 }
@@ -461,15 +466,15 @@ macro_rules! noop {
 fn test_extern_crate() {
     check_highlighting(
         r#"
-        //- /main.rs
+        //- /main.rs crate:main deps:std,alloc
         extern crate std;
         extern crate alloc as abc;
-        //- /std/lib.rs
+        //- /std/lib.rs crate:std
         pub struct S;
-        //- /alloc/lib.rs
+        //- /alloc/lib.rs crate:alloc
         pub struct A
         "#,
-        expect_file!["crates/ide/test_data/highlight_extern_crate.html"],
+        expect_file!["./test_data/highlight_extern_crate.html"],
         false,
     );
 }
@@ -478,7 +483,7 @@ fn test_extern_crate() {
 /// result as HTML, and compares it with the HTML file given as `snapshot`.
 /// Note that the `snapshot` file is overwritten by the rendered HTML.
 fn check_highlighting(ra_fixture: &str, expect: ExpectFile, rainbow: bool) {
-    let (analysis, file_id) = single_file(ra_fixture);
+    let (analysis, file_id) = fixture::file(ra_fixture);
     let actual_html = &analysis.highlight_as_html(file_id, rainbow).unwrap();
     expect.assert_eq(actual_html)
 }

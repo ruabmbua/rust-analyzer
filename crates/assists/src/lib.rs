@@ -128,6 +128,7 @@ mod handlers {
     mod auto_import;
     mod change_return_type_to_result;
     mod change_visibility;
+    mod convert_integer_literal;
     mod early_return;
     mod expand_glob_import;
     mod extract_struct_from_enum_variant;
@@ -155,6 +156,7 @@ mod handlers {
     mod remove_unused_param;
     mod reorder_fields;
     mod replace_if_let_with_match;
+    mod replace_impl_trait_with_generic;
     mod replace_let_with_if_let;
     mod replace_qualified_name_with_use;
     mod replace_unwrap_with_match;
@@ -171,6 +173,7 @@ mod handlers {
             auto_import::auto_import,
             change_return_type_to_result::change_return_type_to_result,
             change_visibility::change_visibility,
+            convert_integer_literal::convert_integer_literal,
             early_return::convert_to_guarded_return,
             expand_glob_import::expand_glob_import,
             extract_struct_from_enum_variant::extract_struct_from_enum_variant,
@@ -202,6 +205,7 @@ mod handlers {
             remove_unused_param::remove_unused_param,
             reorder_fields::reorder_fields,
             replace_if_let_with_match::replace_if_let_with_match,
+            replace_impl_trait_with_generic::replace_impl_trait_with_generic,
             replace_let_with_if_let::replace_let_with_if_let,
             replace_qualified_name_with_use::replace_qualified_name_with_use,
             replace_unwrap_with_match::replace_unwrap_with_match,

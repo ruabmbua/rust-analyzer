@@ -2,8 +2,8 @@
 use std::{mem, sync::Arc};
 
 use base_db::{CrateGraph, SourceRoot, VfsPath};
-use flycheck::FlycheckHandle;
-use ide::AnalysisChange;
+use flycheck::{FlycheckConfig, FlycheckHandle};
+use ide::Change;
 use project_model::{ProcMacroClient, ProjectWorkspace};
 use vfs::{file_set::FileSetConfig, AbsPath, AbsPathBuf, ChangeKind};
 
@@ -92,6 +92,7 @@ impl GlobalState {
         }
     }
     pub(crate) fn fetch_workspaces(&mut self) {
+        log::info!("will fetch workspaces");
         self.task_pool.handle.spawn({
             let linked_projects = self.config.linked_projects.clone();
             let cargo_config = self.config.cargo.clone();
@@ -108,17 +109,18 @@ impl GlobalState {
                             )
                         }
                         LinkedProject::InlineJsonProject(it) => {
-                            Ok(project_model::ProjectWorkspace::Json { project: it.clone() })
+                            project_model::ProjectWorkspace::load_inline(it.clone())
                         }
                     })
                     .collect::<Vec<_>>();
+                log::info!("did fetch workspaces {:?}", workspaces);
                 Task::Workspaces(workspaces)
             }
         });
     }
     pub(crate) fn switch_workspaces(&mut self, workspaces: Vec<anyhow::Result<ProjectWorkspace>>) {
         let _p = profile::span("GlobalState::switch_workspaces");
-        log::info!("reloading projects: {:?}", self.config.linked_projects);
+        log::info!("will switch workspaces: {:?}", workspaces);
 
         let mut has_errors = false;
         let workspaces = workspaces
@@ -169,7 +171,7 @@ impl GlobalState {
             );
         }
 
-        let mut change = AnalysisChange::new();
+        let mut change = Change::new();
 
         let project_folders = ProjectFolders::new(&workspaces);
 
@@ -199,11 +201,14 @@ impl GlobalState {
             let mut crate_graph = CrateGraph::default();
             let vfs = &mut self.vfs.write().0;
             let loader = &mut self.loader;
+            let mem_docs = &self.mem_docs;
             let mut load = |path: &AbsPath| {
-                let contents = loader.handle.load_sync(path);
-                let path = vfs::VfsPath::from(path.to_path_buf());
-                vfs.set_file_contents(path.clone(), contents);
-                vfs.file_id(&path)
+                let vfs_path = vfs::VfsPath::from(path.to_path_buf());
+                if !mem_docs.contains_key(&vfs_path) {
+                    let contents = loader.handle.load_sync(path);
+                    vfs.set_file_contents(vfs_path.clone(), contents);
+                }
+                vfs.file_id(&vfs_path)
             };
             for ws in workspaces.iter() {
                 crate_graph.extend(ws.to_crate_graph(
@@ -223,31 +228,44 @@ impl GlobalState {
         self.analysis_host.apply_change(change);
         self.process_changes();
         self.reload_flycheck();
+        log::info!("did switch workspaces");
     }
 
     fn reload_flycheck(&mut self) {
         let config = match self.config.flycheck.clone() {
             Some(it) => it,
             None => {
-                self.flycheck = None;
+                self.flycheck = Vec::new();
                 return;
             }
         };
 
         let sender = self.flycheck_sender.clone();
-        let sender = Box::new(move |msg| sender.send(msg).unwrap());
         self.flycheck = self
             .workspaces
             .iter()
-            // FIXME: Figure out the multi-workspace situation
-            .find_map(|w| match w {
-                ProjectWorkspace::Cargo { cargo, sysroot: _ } => Some(cargo),
-                ProjectWorkspace::Json { .. } => None,
+            .enumerate()
+            .filter_map(|(id, w)| match w {
+                ProjectWorkspace::Cargo { cargo, sysroot: _ } => Some((id, cargo.workspace_root())),
+                ProjectWorkspace::Json { project, .. } => {
+                    // Enable flychecks for json projects if a custom flycheck command was supplied
+                    // in the workspace configuration.
+                    match config {
+                        FlycheckConfig::CustomCommand { .. } => Some((id, project.path())),
+                        _ => None,
+                    }
+                }
             })
-            .map(move |cargo| {
-                let cargo_project_root = cargo.workspace_root().to_path_buf();
-                FlycheckHandle::spawn(sender, config, cargo_project_root.into())
+            .map(|(id, root)| {
+                let sender = sender.clone();
+                FlycheckHandle::spawn(
+                    id,
+                    Box::new(move |msg| sender.send(msg).unwrap()),
+                    config.clone(),
+                    root.to_path_buf().into(),
+                )
             })
+            .collect();
     }
 }
 

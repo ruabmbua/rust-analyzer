@@ -15,7 +15,8 @@ macro_rules! eprintln {
     ($($tt:tt)*) => { stdx::eprintln!($($tt)*) };
 }
 
-pub mod mock_analysis;
+#[cfg(test)]
+mod fixture;
 
 mod markup;
 mod prime_caches;
@@ -38,11 +39,14 @@ mod join_lines;
 mod matching_brace;
 mod parent_module;
 mod references;
+mod fn_references;
 mod runnables;
 mod status;
 mod syntax_highlighting;
 mod syntax_tree;
 mod typing;
+mod markdown_remove;
+mod doc_links;
 
 use std::sync::Arc;
 
@@ -73,21 +77,25 @@ pub use crate::{
     hover::{HoverAction, HoverConfig, HoverGotoTypeData, HoverResult},
     inlay_hints::{InlayHint, InlayHintsConfig, InlayKind},
     markup::Markup,
-    references::{Declaration, Reference, ReferenceAccess, ReferenceKind, ReferenceSearchResult},
+    prime_caches::PrimeCachesProgress,
+    references::{
+        Declaration, Reference, ReferenceAccess, ReferenceKind, ReferenceSearchResult, RenameError,
+    },
     runnables::{Runnable, RunnableKind, TestId},
     syntax_highlighting::{
         Highlight, HighlightModifier, HighlightModifiers, HighlightTag, HighlightedRange,
     },
 };
 
-pub use assists::{Assist, AssistConfig, AssistId, AssistKind, ResolvedAssist};
+pub use assists::{
+    utils::MergeBehaviour, Assist, AssistConfig, AssistId, AssistKind, ResolvedAssist,
+};
 pub use base_db::{
-    Canceled, CrateGraph, CrateId, Edition, FileId, FilePosition, FileRange, SourceRoot,
+    Canceled, Change, CrateGraph, CrateId, Edition, FileId, FilePosition, FileRange, SourceRoot,
     SourceRootId,
 };
 pub use hir::{Documentation, Semantics};
 pub use ide_db::{
-    change::AnalysisChange,
     label::Label,
     line_index::{LineCol, LineIndex},
     search::SearchScope,
@@ -136,12 +144,8 @@ impl AnalysisHost {
 
     /// Applies changes to the current state of the world. If there are
     /// outstanding snapshots, they will be canceled.
-    pub fn apply_change(&mut self, change: AnalysisChange) {
+    pub fn apply_change(&mut self, change: Change) {
         self.db.apply_change(change)
-    }
-
-    pub fn maybe_collect_garbage(&mut self) {
-        self.db.maybe_collect_garbage();
     }
 
     pub fn collect_garbage(&mut self) {
@@ -194,7 +198,7 @@ impl Analysis {
         file_set.insert(file_id, VfsPath::new_virtual_path("/main.rs".to_string()));
         let source_root = SourceRoot::new_local(file_set);
 
-        let mut change = AnalysisChange::new();
+        let mut change = Change::new();
         change.set_roots(vec![source_root]);
         let mut crate_graph = CrateGraph::default();
         // FIXME: cfg options
@@ -216,12 +220,15 @@ impl Analysis {
     }
 
     /// Debug info about the current state of the analysis.
-    pub fn status(&self) -> Cancelable<String> {
-        self.with_db(|db| status::status(&*db))
+    pub fn status(&self, file_id: Option<FileId>) -> Cancelable<String> {
+        self.with_db(|db| status::status(&*db, file_id))
     }
 
-    pub fn prime_caches(&self, files: Vec<FileId>) -> Cancelable<()> {
-        self.with_db(|db| prime_caches::prime_caches(db, files))
+    pub fn prime_caches<F>(&self, cb: F) -> Cancelable<()>
+    where
+        F: Fn(PrimeCachesProgress) + Sync + std::panic::UnwindSafe,
+    {
+        self.with_db(move |db| prime_caches::prime_caches(db, &cb))
     }
 
     /// Gets the text of the source file.
@@ -366,9 +373,27 @@ impl Analysis {
         })
     }
 
+    /// Finds all methods and free functions for the file. Does not return tests!
+    pub fn find_all_methods(&self, file_id: FileId) -> Cancelable<Vec<FileRange>> {
+        self.with_db(|db| fn_references::find_all_methods(db, file_id))
+    }
+
     /// Returns a short text describing element at position.
-    pub fn hover(&self, position: FilePosition) -> Cancelable<Option<RangeInfo<HoverResult>>> {
-        self.with_db(|db| hover::hover(db, position))
+    pub fn hover(
+        &self,
+        position: FilePosition,
+        links_in_hover: bool,
+        markdown: bool,
+    ) -> Cancelable<Option<RangeInfo<HoverResult>>> {
+        self.with_db(|db| hover::hover(db, position, links_in_hover, markdown))
+    }
+
+    /// Return URL(s) for the documentation of the symbol under the cursor.
+    pub fn external_docs(
+        &self,
+        position: FilePosition,
+    ) -> Cancelable<Option<doc_links::DocumentationLink>> {
+        self.with_db(|db| doc_links::external_docs(db, &position))
     }
 
     /// Computes parameter information for the given call expression.
@@ -479,7 +504,7 @@ impl Analysis {
         &self,
         position: FilePosition,
         new_name: &str,
-    ) -> Cancelable<Option<RangeInfo<SourceChange>>> {
+    ) -> Cancelable<Result<RangeInfo<SourceChange>, RenameError>> {
         self.with_db(|db| references::rename(db, position, new_name))
     }
 

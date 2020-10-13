@@ -2,8 +2,9 @@
 //!
 //! Based on cli flags, either spawns an LSP server, or runs a batch analysis
 mod args;
+mod logger;
 
-use std::{convert::TryFrom, process};
+use std::{convert::TryFrom, env, fs, path::PathBuf, process};
 
 use lsp_server::Connection;
 use project_model::ProjectManifest;
@@ -26,8 +27,8 @@ fn main() {
 }
 
 fn try_main() -> Result<()> {
-    setup_logging()?;
     let args = args::Args::parse()?;
+    setup_logging(args.log_file)?;
     match args.command {
         args::Command::RunServer => run_server()?,
         args::Command::ProcMacro => proc_macro_srv::cli::run()?,
@@ -37,8 +38,8 @@ fn try_main() -> Result<()> {
         args::Command::Highlight { rainbow } => cli::highlight(rainbow)?,
         args::Command::AnalysisStats(cmd) => cmd.run(args.verbosity)?,
         args::Command::Bench(cmd) => cmd.run(args.verbosity)?,
-        args::Command::Diagnostics { path, load_output_dirs, with_proc_macro, all } => {
-            cli::diagnostics(path.as_ref(), load_output_dirs, with_proc_macro, all)?
+        args::Command::Diagnostics { path, load_output_dirs, with_proc_macro } => {
+            cli::diagnostics(path.as_ref(), load_output_dirs, with_proc_macro)?
         }
         args::Command::Ssr { rules } => {
             cli::apply_ssr_rules(rules)?;
@@ -52,19 +53,32 @@ fn try_main() -> Result<()> {
     Ok(())
 }
 
-fn setup_logging() -> Result<()> {
-    std::env::set_var("RUST_BACKTRACE", "short");
-    env_logger::try_init_from_env("RA_LOG")?;
+fn setup_logging(log_file: Option<PathBuf>) -> Result<()> {
+    env::set_var("RUST_BACKTRACE", "short");
+
+    let log_file = match log_file {
+        Some(path) => {
+            if let Some(parent) = path.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            Some(fs::File::create(path)?)
+        }
+        None => None,
+    };
+    let filter = env::var("RA_LOG").ok();
+    logger::Logger::new(log_file, filter.as_deref()).install();
+
     profile::init();
     Ok(())
 }
 
 fn run_server() -> Result<()> {
-    log::info!("lifecycle: server started");
+    log::info!("server will start");
 
     let (connection, io_threads) = Connection::stdio();
 
     let (initialize_id, initialize_params) = connection.initialize_start()?;
+    log::info!("InitializeParams: {}", initialize_params);
     let initialize_params =
         from_json::<lsp_types::InitializeParams>("InitializeParams", initialize_params)?;
 
@@ -94,7 +108,7 @@ fn run_server() -> Result<()> {
         {
             Some(it) => it,
             None => {
-                let cwd = std::env::current_dir()?;
+                let cwd = env::current_dir()?;
                 AbsPathBuf::assert(cwd)
             }
         };
@@ -118,10 +132,13 @@ fn run_server() -> Result<()> {
                 .filter(|workspaces| !workspaces.is_empty())
                 .unwrap_or_else(|| vec![config.root_path.clone()]);
 
-            config.linked_projects = ProjectManifest::discover_all(&workspace_roots)
-                .into_iter()
-                .map(LinkedProject::from)
-                .collect();
+            let discovered = ProjectManifest::discover_all(&workspace_roots);
+            log::info!("discovered projects: {:?}", discovered);
+            if discovered.is_empty() {
+                log::error!("failed to find any projects in {:?}", workspace_roots);
+            }
+
+            config.linked_projects = discovered.into_iter().map(LinkedProject::from).collect();
         }
 
         config
@@ -129,8 +146,7 @@ fn run_server() -> Result<()> {
 
     rust_analyzer::main_loop(config, connection)?;
 
-    log::info!("shutting down IO...");
     io_threads.join()?;
-    log::info!("... IO is down");
+    log::info!("server did shut down");
     Ok(())
 }

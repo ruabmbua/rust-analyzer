@@ -13,7 +13,7 @@ use hir_expand::{
     hygiene::Hygiene,
     name::{AsName, Name},
 };
-use syntax::ast;
+use syntax::ast::{self};
 
 use crate::{
     type_ref::{TypeBound, TypeRef},
@@ -54,10 +54,6 @@ impl ModPath {
     pub fn from_segments(kind: PathKind, segments: impl IntoIterator<Item = Name>) -> ModPath {
         let segments = segments.into_iter().collect::<Vec<_>>();
         ModPath { kind, segments }
-    }
-
-    pub(crate) fn from_name_ref(name_ref: &ast::NameRef) -> ModPath {
-        name_ref.as_name().into()
     }
 
     /// Converts an `tt::Ident` into a single-identifier `Path`.
@@ -290,10 +286,8 @@ impl Display for ModPath {
         };
         match self.kind {
             PathKind::Plain => {}
+            PathKind::Super(0) => add_segment("self")?,
             PathKind::Super(n) => {
-                if n == 0 {
-                    add_segment("self")?;
-                }
                 for _ in 0..n {
                     add_segment("super")?;
                 }

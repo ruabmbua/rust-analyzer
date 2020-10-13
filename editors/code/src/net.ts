@@ -18,7 +18,8 @@ const OWNER = "rust-analyzer";
 const REPO = "rust-analyzer";
 
 export async function fetchRelease(
-    releaseTag: string
+    releaseTag: string,
+    githubToken: string | null | undefined,
 ): Promise<GithubRelease> {
 
     const apiEndpointPath = `/repos/${OWNER}/${REPO}/releases/tags/${releaseTag}`;
@@ -27,7 +28,12 @@ export async function fetchRelease(
 
     log.debug("Issuing request for released artifacts metadata to", requestUrl);
 
-    const response = await fetch(requestUrl, { headers: { Accept: "application/vnd.github.v3+json" } });
+    const headers: Record<string, string> = { Accept: "application/vnd.github.v3+json" };
+    if (githubToken != null) {
+        headers.Authorization = "token " + githubToken;
+    }
+
+    const response = await fetch(requestUrl, { headers: headers });
 
     if (!response.ok) {
         log.error("Error fetching artifact release info", {
@@ -70,6 +76,7 @@ interface DownloadOpts {
     dest: string;
     mode?: number;
     gunzip?: boolean;
+    overwrite?: boolean;
 }
 
 export async function download(opts: DownloadOpts) {
@@ -78,6 +85,13 @@ export async function download(opts: DownloadOpts) {
     const dest = path.parse(opts.dest);
     const randomHex = crypto.randomBytes(5).toString("hex");
     const tempFile = path.join(dest.dir, `${dest.name}${randomHex}`);
+
+    if (opts.overwrite) {
+        // Unlinking the exe file before moving new one on its place should prevent ETXTBSY error.
+        await fs.promises.unlink(opts.dest).catch(err => {
+            if (err.code !== "ENOENT") throw err;
+        });
+    }
 
     await vscode.window.withProgress(
         {
@@ -133,6 +147,14 @@ async function downloadFile(
     const srcStream = gunzip ? res.body.pipe(zlib.createGunzip()) : res.body;
 
     await pipeline(srcStream, destFileStream);
+
+    // Don't apply the workaround in fixed versions of nodejs, since the process
+    // freezes on them, the process waits for no-longer emitted `close` event.
+    // The fix was applied in commit 7eed9d6bcc in v13.11.0
+    // See the nodejs changelog:
+    // https://github.com/nodejs/node/blob/master/doc/changelogs/CHANGELOG_V13.md
+    const [, major, minor] = /v(\d+)\.(\d+)\.(\d+)/.exec(process.version)!;
+    if (+major > 13 || (+major === 13 && +minor >= 11)) return;
 
     await new Promise<void>(resolve => {
         destFileStream.on("close", resolve);
